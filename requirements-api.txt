@@ -1,0 +1,18 @@
+# Lightweight requirements for a read-only API deployment (e.g. Render free
+# tier) that only ever serves /clusters, /articles, /stats etc. from an
+# already-populated database — never triggers the scrape/embed/cluster
+# pipeline itself (that runs elsewhere, against the same DATABASE_URL, using
+# the full requirements.txt).
+#
+# Deliberately excludes torch, sentence-transformers, hdbscan, trafilatura,
+# scikit-learn, and the scraping libraries (requests/bs4/feedparser/lxml) —
+# none of api.py's read routes import them, and installing them would burn
+# through a free tier's build minutes/disk for code that's never used there.
+# Run with PIPELINE_ENABLED=false so the routes that DO need those packages
+# (/pipeline/run, /submit, /sources/{id}/scrape) return a clean 503 instead
+# of crashing with an ImportError if ever called on this deployment.
+fastapi
+uvicorn[standard]
+psycopg2-binary
+pydantic
+python-dotenv

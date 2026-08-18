@@ -1,0 +1,13 @@
+# Build context for backend/Dockerfile and backend/Dockerfile.api is
+# backend/ itself — Docker reads .dockerignore from the context root, so
+# this lives here (not the repo root).
+
+venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.env
+*.log
+.dockerignore
+Dockerfile*
+data/

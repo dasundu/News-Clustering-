@@ -1,0 +1,32 @@
+# backend/Dockerfile.api — lightweight, read-only API image.
+#
+# Serves /clusters, /articles, /stats etc. from an already-populated
+# database; never touches torch/sentence-transformers/hdbscan, so it
+# installs requirements-api.txt instead of the full requirements.txt — see
+# README.md's Deployment section for why this split exists (it's the same
+# reasoning behind render.yaml's Render deployment, containerized instead
+# for anyone self-hosting on their own infra — a VPS, Fly.io, Railway, etc.).
+#
+# Build from backend/ itself — the frontend is a fully independent Next.js
+# app now (its own process, its own Dockerfile), not something this image
+# needs to contain:
+#
+#   docker build -f backend/Dockerfile.api -t sl-news-api backend/
+#   docker run -p 8000:8000 --env-file backend/.env \
+#       -e PIPELINE_ENABLED=false sl-news-api
+
+FROM python:3.13-slim
+
+WORKDIR /app
+COPY requirements-api.txt requirements-api.txt
+RUN pip install --no-cache-dir -r requirements-api.txt
+
+COPY . .
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONIOENCODING=utf-8 \
+    PIPELINE_ENABLED=false
+
+EXPOSE 8000
+
+CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]

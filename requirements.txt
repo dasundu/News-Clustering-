@@ -1,0 +1,17 @@
+fastapi
+uvicorn[standard]
+psycopg2-binary
+pydantic
+requests
+brotli          # sites served with Content-Encoding: br (scraper advertises it)
+beautifulsoup4
+feedparser
+lxml
+trafilatura
+sentence-transformers
+hdbscan
+scikit-learn
+numpy>=2.0,<3.0
+apscheduler
+keybert         # cluster-label fallback for weak/low-quality headlines
+python-dotenv

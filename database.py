@@ -1,0 +1,1072 @@
+# database.py
+"""
+Database operations for news articles — PostgreSQL (Neon) backend.
+"""
+
+import logging
+import time
+import psycopg2
+import psycopg2.extras
+import psycopg2.pool
+from typing import List, Dict, Tuple, Optional
+from config import DATABASE_URL
+
+logger = logging.getLogger(__name__)
+
+_pool = psycopg2.pool.ThreadedConnectionPool(1, 20, DATABASE_URL)
+_pool_lock = __import__('threading').Lock()
+
+
+def _get_conn():
+    """Get a live connection from the pool, recreating it if Neon has suspended."""
+    global _pool
+    try:
+        conn = _pool.getconn()
+        if conn.closed:
+            raise psycopg2.OperationalError("closed")
+        try:
+            conn.cursor().execute('SELECT 1')  # verify SSL is still alive
+        except psycopg2.OperationalError:
+            try:
+                _pool.putconn(conn)
+            except Exception:
+                pass
+            raise
+        return conn
+    # PoolError ("pool is closed"/"exhausted") is a *sibling* of OperationalError,
+    # not a subclass — it must be caught separately, or a pool broken by one
+    # failure (below) raises it uncaught on every call after, forever, since
+    # nothing else ever rebuilds `_pool`. This previously took the continuous
+    # scraper down for hours with every run logged as "executed successfully"
+    # because scheduler.py catches and logs the exception per run.
+    except (psycopg2.OperationalError, psycopg2.pool.PoolError):
+        with _pool_lock:
+            try:
+                _pool.closeall()
+            except Exception:
+                pass
+            # Retry pool creation itself: if Neon is mid-wake, the first
+            # attempt can fail too. Without this, that failure would escape
+            # uncaught here and leave `_pool` closed and never replaced.
+            last_err = None
+            for attempt in range(3):
+                try:
+                    _pool = psycopg2.pool.ThreadedConnectionPool(1, 20, DATABASE_URL)
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    time.sleep(1.5 * (attempt + 1))
+            if last_err is not None:
+                raise last_err
+        return _pool.getconn()
+
+
+class ArticleDatabase:
+
+    def __init__(self):
+        self.init_db()
+
+    def _connect(self):
+        return _get_conn()
+
+    def _release(self, conn):
+        try:
+            _pool.putconn(conn)
+        except Exception:
+            pass
+
+    def init_db(self):
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS articles (
+                    id           SERIAL PRIMARY KEY,
+                    title        TEXT NOT NULL,
+                    body         TEXT,
+                    url          TEXT UNIQUE NOT NULL,
+                    published_at TIMESTAMP,
+                    source       TEXT NOT NULL,
+                    category     TEXT,
+                    scraped_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    body_fetched INTEGER DEFAULT 0,
+                    body_cleaned TEXT,
+                    embedding    BYTEA,
+                    cluster_id   INTEGER,
+                    image_url    TEXT
+                )
+            ''')
+            cur.execute('ALTER TABLE articles ADD COLUMN IF NOT EXISTS image_url TEXT')
+            # embedding_model records which model produced the stored vector.
+            # Without this, changing EMBEDDING_MODEL would silently mix
+            # vectors from two different, non-comparable embedding spaces
+            # into the same clustering run with no error — HDBSCAN would
+            # treat them as directly comparable when they mathematically
+            # aren't. Recording the model lets get_articles_without_embedding
+            # detect the mismatch and safely re-embed under the new model.
+            # embedding_source_hash records a hash of the exact text that
+            # was embedded, so a body update (re-cleaning, a source
+            # correction) can also be detected as making the stored vector
+            # stale, independent of any model change.
+            cur.execute('ALTER TABLE articles ADD COLUMN IF NOT EXISTS embedding_model TEXT')
+            cur.execute('ALTER TABLE articles ADD COLUMN IF NOT EXISTS embedding_source_hash TEXT')
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS custom_sources (
+                    id           SERIAL PRIMARY KEY,
+                    name         TEXT NOT NULL,
+                    url          TEXT UNIQUE NOT NULL,
+                    added_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_scraped TIMESTAMP,
+                    active       INTEGER DEFAULT 1
+                )
+            ''')
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS cluster_labels (
+                    cluster_id  INTEGER PRIMARY KEY,
+                    event_title TEXT NOT NULL,
+                    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            # Topics: the coarser grouping layer *above* event clusters —
+            # several related events ("IMF loan tranche approved", "IMF
+            # conditions debated in parliament") rolled up under one theme.
+            # Membership lives on cluster_labels.topic_id rather than on
+            # articles, so an article's topic is reached via its cluster and
+            # no article row is ever rewritten by topic clustering. See
+            # clusterer.py's ClusterTopicBuilder.
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS topics (
+                    topic_id    SERIAL PRIMARY KEY,
+                    topic_title TEXT NOT NULL,
+                    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            cur.execute('ALTER TABLE cluster_labels ADD COLUMN IF NOT EXISTS topic_id INTEGER')
+            cur.execute('CREATE INDEX IF NOT EXISTS idx_cluster_labels_topic ON cluster_labels(topic_id)')
+
+            # ── Claim retrieval (/search) ──────────────────────────────────
+            # Additive only: `embedding` BYTEA stays the source of truth that
+            # clusterer.py reads, and `embedding_vec` mirrors it purely so
+            # similarity search can run *inside* Postgres. That keeps the
+            # 2,878-vector scan off the wire (~4MB per query if fetched into
+            # Python) and means the search path never needs numpy.
+            #
+            # `fts` is a GENERATED column: Postgres recomputes it on every
+            # title/body_cleaned write by itself, so no pipeline stage has to
+            # remember to maintain it.
+            self._search_available = True
+            try:
+                cur.execute('CREATE EXTENSION IF NOT EXISTS vector')
+                cur.execute('ALTER TABLE articles ADD COLUMN IF NOT EXISTS embedding_vec vector(384)')
+                cur.execute('''
+                    CREATE INDEX IF NOT EXISTS idx_articles_vec ON articles
+                    USING hnsw (embedding_vec vector_cosine_ops)
+                ''')
+            except Exception as e:
+                # A managed Postgres without pgvector can still run everything
+                # else; only /search degrades, and api.py reports that rather
+                # than 500ing. Rolled back so the rest of init_db can proceed
+                # on a clean transaction.
+                conn.rollback()
+                self._search_available = False
+                logger.warning(f"pgvector unavailable — /search dense channel disabled: {e}")
+
+            cur.execute('''
+                ALTER TABLE articles ADD COLUMN IF NOT EXISTS fts tsvector
+                GENERATED ALWAYS AS (
+                    to_tsvector('english',
+                        coalesce(title, '') || ' ' || coalesce(body_cleaned, ''))
+                ) STORED
+            ''')
+            cur.execute('CREATE INDEX IF NOT EXISTS idx_articles_fts ON articles USING GIN (fts)')
+
+            # Queries we had no answer for. Two uses: a coverage-gap signal
+            # (what are people asking about that our sources don't carry?) and
+            # a growing set of real retrieval failures to analyse.
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS unmatched_queries (
+                    id          SERIAL PRIMARY KEY,
+                    query_text  TEXT NOT NULL,
+                    best_score  REAL,
+                    asked_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            for idx in [
+                'CREATE INDEX IF NOT EXISTS idx_url          ON articles(url)',
+                'CREATE INDEX IF NOT EXISTS idx_source       ON articles(source)',
+                'CREATE INDEX IF NOT EXISTS idx_category     ON articles(category)',
+                'CREATE INDEX IF NOT EXISTS idx_published    ON articles(published_at)',
+                'CREATE INDEX IF NOT EXISTS idx_scraped      ON articles(scraped_at)',
+                'CREATE INDEX IF NOT EXISTS idx_cluster      ON articles(cluster_id)',
+                'CREATE INDEX IF NOT EXISTS idx_body_fetched ON articles(body_fetched)',
+            ]:
+                cur.execute(idx)
+        conn.commit()
+        self._release(conn)
+
+    # ── write ──────────────────────────────────────────────────────────────
+
+    def save_article(self, article: Dict) -> bool:
+        try:
+            conn = self._connect()
+            with conn.cursor() as cur:
+                cur.execute('''
+                    INSERT INTO articles (title, body, url, published_at, source, category, image_url, body_fetched)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (url) DO NOTHING
+                ''', (
+                    article['title'][:500],
+                    article.get('body', '')[:50000],
+                    article['url'],
+                    article.get('published_at'),
+                    article['source'],
+                    article.get('category', 'general'),
+                    article.get('image_url') or None,
+                    # sources that supply the body up front (e.g. JSON APIs whose
+                    # article pages render client-side) mark it fetched so the
+                    # extractor step doesn't overwrite it with an empty result
+                    int(article.get('body_fetched', 0)),
+                ))
+                saved = cur.rowcount > 0
+            conn.commit()
+            self._release(conn)
+            return saved
+        except Exception as e:
+            logger.error(f"Error saving article: {e}")
+            return False
+
+    def save_batch(self, articles: List[Dict]) -> int:
+        return sum(1 for a in articles if self.save_article(a))
+
+    def update_body(self, article_id: int, body: str, image_url: str = None):
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE articles SET body=%s, body_fetched=1, image_url=COALESCE(%s, image_url) WHERE id=%s",
+                (body[:50000], image_url or None, article_id)
+            )
+        conn.commit()
+        self._release(conn)
+
+    def get_articles_to_clean(self) -> List[Dict]:
+        conn = self._connect()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, title, body FROM articles WHERE body_fetched=1 AND body_cleaned IS NULL AND body != ''"
+            )
+            rows = cur.fetchall()
+        self._release(conn)
+        return [dict(r) for r in rows]
+
+    def update_article_title(self, article_id: int, title: str):
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("UPDATE articles SET title=%s WHERE id=%s", (title[:500], article_id))
+        conn.commit()
+        self._release(conn)
+
+    def update_article_category(self, article_id: int, category: str):
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("UPDATE articles SET category=%s WHERE id=%s", (category, article_id))
+        conn.commit()
+        self._release(conn)
+
+    def update_cleaned_body(self, article_id: int, cleaned: str):
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE articles SET body_cleaned=%s WHERE id=%s",
+                (cleaned, article_id)
+            )
+        conn.commit()
+        self._release(conn)
+
+    def update_embedding(self, article_id: int, embedding_bytes: bytes,
+                          embedding_model: str, source_hash: str,
+                          embedding_list: Optional[List[float]] = None):
+        """
+        Stores the vector twice, deliberately: `embedding` (BYTEA) is what
+        clusterer.py reads and stays the source of truth, while
+        `embedding_vec` is the pgvector mirror that /search queries. Passing
+        embedding_list keeps them written in the same transaction so the two
+        can never disagree about a given article.
+        """
+        conn = self._connect()
+        with conn.cursor() as cur:
+            if embedding_list is not None:
+                cur.execute(
+                    "UPDATE articles SET embedding=%s, embedding_model=%s, "
+                    "embedding_source_hash=%s, embedding_vec=%s WHERE id=%s",
+                    (psycopg2.Binary(embedding_bytes), embedding_model, source_hash,
+                     str(embedding_list), article_id)
+                )
+            else:
+                cur.execute(
+                    "UPDATE articles SET embedding=%s, embedding_model=%s, "
+                    "embedding_source_hash=%s WHERE id=%s",
+                    (psycopg2.Binary(embedding_bytes), embedding_model, source_hash, article_id)
+                )
+        conn.commit()
+        self._release(conn)
+
+    def backfill_embedding_vec(self, batch_size: int = 500) -> int:
+        """
+        One-off migration: populate embedding_vec from the existing BYTEA
+        column for articles embedded before /search existed. Converts in
+        Postgres-side batches rather than one big UPDATE so a large corpus
+        doesn't hold a single long transaction open against Neon.
+        Idempotent — only touches rows where embedding_vec IS NULL.
+        """
+        import numpy as np
+        total = 0
+        while True:
+            conn = self._connect()
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT id, embedding FROM articles "
+                    "WHERE embedding IS NOT NULL AND embedding_vec IS NULL LIMIT %s",
+                    (batch_size,)
+                )
+                rows = cur.fetchall()
+                if not rows:
+                    self._release(conn)
+                    break
+                payload = [
+                    (str(np.frombuffer(bytes(r['embedding']), dtype='float32').tolist()), r['id'])
+                    for r in rows
+                ]
+                psycopg2.extras.execute_batch(
+                    cur, "UPDATE articles SET embedding_vec=%s WHERE id=%s", payload
+                )
+            conn.commit()
+            self._release(conn)
+            total += len(rows)
+            logger.info(f"  backfilled embedding_vec for {total} articles...")
+        return total
+
+    def update_cluster_ids(self, assignments: List[Tuple[int, int]]):
+        conn = self._connect()
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_batch(
+                cur,
+                "UPDATE articles SET cluster_id=%s WHERE id=%s",
+                assignments
+            )
+        conn.commit()
+        self._release(conn)
+
+    def save_cluster_label(self, cluster_id: int, title: str):
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute('''
+                INSERT INTO cluster_labels (cluster_id, event_title, updated_at)
+                VALUES (%s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (cluster_id) DO UPDATE
+                SET event_title=EXCLUDED.event_title, updated_at=CURRENT_TIMESTAMP
+            ''', (cluster_id, title))
+        conn.commit()
+        self._release(conn)
+
+    def get_cluster_labels(self) -> dict:
+        conn = self._connect()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute('SELECT cluster_id, event_title FROM cluster_labels')
+            rows = cur.fetchall()
+        self._release(conn)
+        return {r['cluster_id']: r['event_title'] for r in rows}
+
+    # ── topics (the grouping layer above event clusters) ───────────────────
+
+    def get_topic_assignments(self) -> Dict[int, int]:
+        """{cluster_id: topic_id} for every cluster currently in a topic —
+        the previous run's assignment, which topic-identity matching needs to
+        recover so an unchanged theme keeps its topic_id (same reasoning as
+        get_recent_embeddings recovering cluster_id for events)."""
+        conn = self._connect()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute('SELECT cluster_id, topic_id FROM cluster_labels WHERE topic_id IS NOT NULL')
+            rows = cur.fetchall()
+        self._release(conn)
+        return {r['cluster_id']: r['topic_id'] for r in rows}
+
+    def create_topic(self, title: str) -> int:
+        """Mint a new topic id. SERIAL rather than MAX(topic_id)+1 so two
+        concurrent callers can't be handed the same id."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                'INSERT INTO topics (topic_title) VALUES (%s) RETURNING topic_id',
+                (title,)
+            )
+            (topic_id,) = cur.fetchone()
+        conn.commit()
+        self._release(conn)
+        return topic_id
+
+    def update_topic_title(self, topic_id: int, title: str):
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                'UPDATE topics SET topic_title=%s, updated_at=CURRENT_TIMESTAMP WHERE topic_id=%s',
+                (title, topic_id)
+            )
+        conn.commit()
+        self._release(conn)
+
+    def set_cluster_topics(self, assignments: List[Tuple[Optional[int], int]]):
+        """Bulk (topic_id, cluster_id) writes. topic_id=None clears a
+        cluster's topic — what a cluster that no longer groups with anything
+        gets, rather than being left pointing at a topic it has left."""
+        if not assignments:
+            return
+        conn = self._connect()
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_batch(
+                cur,
+                'UPDATE cluster_labels SET topic_id=%s WHERE cluster_id=%s',
+                assignments
+            )
+        conn.commit()
+        self._release(conn)
+
+    def delete_empty_topics(self) -> int:
+        """Drop topic rows no cluster points at any more — a topic whose
+        member events all moved elsewhere is not a topic."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute('''
+                DELETE FROM topics t
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM cluster_labels cl WHERE cl.topic_id = t.topic_id
+                )
+            ''')
+            deleted = cur.rowcount
+        conn.commit()
+        self._release(conn)
+        return deleted
+
+    def get_topics(self, min_clusters: int = 2) -> List[Dict]:
+        conn = self._connect()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute('''
+                SELECT
+                    t.topic_id,
+                    t.topic_title,
+                    COUNT(DISTINCT cl.cluster_id) as cluster_count,
+                    COUNT(DISTINCT (a.source, LOWER(TRIM(a.title)))) as article_count,
+                    STRING_AGG(DISTINCT a.source, ',') as sources,
+                    MAX(a.published_at) as latest_at,
+                    (SELECT a3.image_url FROM articles a3
+                     JOIN cluster_labels cl3 ON cl3.cluster_id = a3.cluster_id
+                     WHERE cl3.topic_id = t.topic_id
+                       AND a3.image_url IS NOT NULL AND a3.image_url != ''
+                     ORDER BY a3.published_at DESC NULLS LAST LIMIT 1) as topic_image,
+                    (SELECT a4.category FROM articles a4
+                     JOIN cluster_labels cl4 ON cl4.cluster_id = a4.cluster_id
+                     WHERE cl4.topic_id = t.topic_id AND a4.category IS NOT NULL
+                     GROUP BY a4.category ORDER BY COUNT(*) DESC LIMIT 1) as category
+                FROM topics t
+                JOIN cluster_labels cl ON cl.topic_id = t.topic_id
+                JOIN articles a ON a.cluster_id = cl.cluster_id
+                WHERE a.body IS NOT NULL AND a.body != ''
+                GROUP BY t.topic_id, t.topic_title
+                HAVING COUNT(DISTINCT cl.cluster_id) >= %s
+                ORDER BY latest_at DESC NULLS LAST
+            ''', (min_clusters,))
+            rows = cur.fetchall()
+        self._release(conn)
+        result = []
+        for r in rows:
+            d = dict(r)
+            d['sources'] = d['sources'].split(',') if d['sources'] else []
+            if d.get('latest_at') and hasattr(d['latest_at'], 'isoformat'):
+                d['latest_at'] = d['latest_at'].isoformat()
+            result.append(d)
+        return result
+
+    # ── claim retrieval (/search) ──────────────────────────────────────────
+
+    def search_dense(self, query_vec: List[float], limit: int = 50) -> List[Dict]:
+        """
+        Nearest articles by cosine distance, computed in Postgres via
+        pgvector's `<=>` operator. Only clustered articles with a real body
+        are eligible — an unclustered or body-less article can't be reported
+        as an event match. Returns rows ordered best-first with `score` as
+        cosine *similarity* (1 - distance), matching the convention used
+        everywhere else in this codebase.
+        """
+        conn = self._connect()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute('''
+                SELECT id, cluster_id, title, source, url, published_at,
+                       1 - (embedding_vec <=> %s::vector) AS score
+                FROM articles
+                WHERE embedding_vec IS NOT NULL
+                  AND cluster_id IS NOT NULL AND cluster_id >= 0
+                  AND body IS NOT NULL AND body != ''
+                ORDER BY embedding_vec <=> %s::vector
+                LIMIT %s
+            ''', (str(query_vec), str(query_vec), limit))
+            rows = cur.fetchall()
+        self._release(conn)
+        return [dict(r) for r in rows]
+
+    def search_lexical(self, query_text: str, limit: int = 50) -> List[Dict]:
+        """
+        Keyword channel over the generated `fts` column. Uses ts_rank_cd
+        (cover density) rather than plain ts_rank so proximity of the query
+        terms counts, which matters for multi-word claims. plainto_tsquery
+        rather than to_tsquery so arbitrary user text can't raise a syntax
+        error on stray punctuation.
+        """
+        conn = self._connect()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute('''
+                SELECT id, cluster_id, title, source, url, published_at,
+                       ts_rank_cd(fts, plainto_tsquery('english', %s)) AS score
+                FROM articles
+                WHERE fts @@ plainto_tsquery('english', %s)
+                  AND cluster_id IS NOT NULL AND cluster_id >= 0
+                  AND body IS NOT NULL AND body != ''
+                ORDER BY score DESC
+                LIMIT %s
+            ''', (query_text, query_text, limit))
+            rows = cur.fetchall()
+        self._release(conn)
+        return [dict(r) for r in rows]
+
+    def get_cluster_summaries(self, cluster_ids: List[int]) -> Dict[int, Dict]:
+        """
+        Display metadata for a specific set of clusters — label, topic,
+        distinct-article count, sources. Same shape the /clusters endpoints
+        return, so a search result is interchangeable with a feed item.
+        """
+        if not cluster_ids:
+            return {}
+        conn = self._connect()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute('''
+                SELECT a.cluster_id,
+                       COUNT(DISTINCT (a.source, LOWER(TRIM(a.title)))) AS article_count,
+                       STRING_AGG(DISTINCT a.source, ',') AS sources,
+                       MAX(a.published_at) AS latest_at,
+                       (SELECT a2.category FROM articles a2
+                        WHERE a2.cluster_id = a.cluster_id AND a2.category IS NOT NULL
+                        GROUP BY a2.category ORDER BY COUNT(*) DESC LIMIT 1) AS category,
+                       cl.event_title, cl.topic_id, t.topic_title
+                FROM articles a
+                LEFT JOIN cluster_labels cl ON cl.cluster_id = a.cluster_id
+                LEFT JOIN topics t ON t.topic_id = cl.topic_id
+                WHERE a.cluster_id = ANY(%s)
+                  AND a.body IS NOT NULL AND a.body != ''
+                GROUP BY a.cluster_id, cl.event_title, cl.topic_id, t.topic_title
+            ''', (cluster_ids,))
+            rows = cur.fetchall()
+        self._release(conn)
+        out = {}
+        for r in rows:
+            d = dict(r)
+            d['sources'] = d['sources'].split(',') if d['sources'] else []
+            if d.get('latest_at') and hasattr(d['latest_at'], 'isoformat'):
+                d['latest_at'] = d['latest_at'].isoformat()
+            out[d['cluster_id']] = d
+        return out
+
+    def log_unmatched_query(self, query_text: str, best_score: float):
+        """Best-effort — a logging failure must never fail the user's search."""
+        try:
+            conn = self._connect()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO unmatched_queries (query_text, best_score) VALUES (%s, %s)",
+                    (query_text[:2000], best_score)
+                )
+            conn.commit()
+            self._release(conn)
+        except Exception as e:
+            logger.warning(f"Could not log unmatched query: {e}")
+
+    def get_topic_for_cluster(self, cluster_id: int) -> Optional[Dict]:
+        conn = self._connect()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute('''
+                SELECT t.topic_id, t.topic_title
+                FROM cluster_labels cl
+                JOIN topics t ON t.topic_id = cl.topic_id
+                WHERE cl.cluster_id = %s
+            ''', (cluster_id,))
+            row = cur.fetchone()
+        self._release(conn)
+        return dict(row) if row else None
+
+    def get_topic(self, topic_id: int) -> Optional[Dict]:
+        conn = self._connect()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute('SELECT topic_id, topic_title FROM topics WHERE topic_id=%s', (topic_id,))
+            row = cur.fetchone()
+        self._release(conn)
+        return dict(row) if row else None
+
+    def get_article_title(self, article_id: int) -> str:
+        conn = self._connect()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute('SELECT title FROM articles WHERE id=%s', (article_id,))
+            row = cur.fetchone()
+        self._release(conn)
+        return row['title'] if row else ''
+
+    def get_article_titles_batch(self, article_ids: List[int]) -> Dict[int, str]:
+        if not article_ids:
+            return {}
+        conn = self._connect()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute('SELECT id, title FROM articles WHERE id = ANY(%s)', (article_ids,))
+            rows = cur.fetchall()
+        self._release(conn)
+        return {r['id']: r['title'] for r in rows}
+
+    # ── read ───────────────────────────────────────────────────────────────
+
+    def url_exists(self, url: str) -> bool:
+        try:
+            conn = self._connect()
+            with conn.cursor() as cur:
+                cur.execute('SELECT id FROM articles WHERE url=%s', (url,))
+                row = cur.fetchone()
+            self._release(conn)
+            return row is not None
+        except Exception as e:
+            logger.error(f"Error checking URL: {e}")
+            return False
+
+    def get_articles_without_image(self, limit: int = 200) -> List[Dict]:
+        conn = self._connect()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, url FROM articles WHERE body_fetched=1 AND (image_url IS NULL OR image_url='') LIMIT %s",
+                (limit,)
+            )
+            rows = cur.fetchall()
+        self._release(conn)
+        return [dict(r) for r in rows]
+
+    def update_image(self, article_id: int, image_url: str):
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE articles SET image_url=%s WHERE id=%s",
+                (image_url or None, article_id)
+            )
+        conn.commit()
+        self._release(conn)
+
+    def get_articles_without_body(self, limit: int = 50) -> List[Dict]:
+        conn = self._connect()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, url, title, source FROM articles WHERE body_fetched=0 LIMIT %s",
+                (limit,)
+            )
+            rows = cur.fetchall()
+        self._release(conn)
+        return [dict(r) for r in rows]
+
+    def get_articles_without_embedding(self, current_model: str, limit: int = 500) -> List[Dict]:
+        """
+        Articles with no embedding yet, *or* whose stored embedding_model
+        doesn't match current_model — the latter is what makes changing
+        EMBEDDING_MODEL in config.py safe: every article is automatically
+        picked up for re-embedding under the new model on the next run,
+        instead of silently keeping a stale vector from a different,
+        non-comparable embedding space forever.
+        """
+        conn = self._connect()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, title, category, COALESCE(body_cleaned, '') as body_cleaned "
+                "FROM articles "
+                "WHERE body_fetched=1 "
+                "AND (embedding IS NULL OR embedding_model IS DISTINCT FROM %s) "
+                "LIMIT %s",
+                (current_model, limit)
+            )
+            rows = cur.fetchall()
+        self._release(conn)
+        return [dict(r) for r in rows]
+
+    def get_all_embeddings(self) -> List[Tuple[int, bytes]]:
+        conn = self._connect()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT id, embedding FROM articles WHERE embedding IS NOT NULL")
+            rows = cur.fetchall()
+        self._release(conn)
+        return [(r['id'], bytes(r['embedding'])) for r in rows]
+
+    def get_recent_embeddings(self, days: int) -> List[Dict]:
+        """
+        Embedded articles from the last `days`, with whatever cluster_id they
+        already carry (NULL/-1 for none). Used by the clusterer to re-fit only
+        a recent window instead of the whole historical corpus each run, and
+        to recover each article's *previous* assignment so new cluster
+        identities can be matched back to it (see clusterer.py). `source` and
+        `effective_date` are included for the cluster-quality refinement pass
+        (outlet-dominance and time-span checks) that runs before that match.
+        """
+        conn = self._connect()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id, embedding, cluster_id, source,
+                       COALESCE(published_at, scraped_at) AS effective_date
+                FROM articles
+                WHERE embedding IS NOT NULL
+                  AND COALESCE(published_at, scraped_at) >= NOW() - (%s || ' days')::interval
+            """, (days,))
+            rows = cur.fetchall()
+        self._release(conn)
+        return [
+            {
+                'id': r['id'], 'embedding': bytes(r['embedding']),
+                'cluster_id': r['cluster_id'], 'source': r['source'],
+                'effective_date': r['effective_date'],
+            }
+            for r in rows
+        ]
+
+    def get_max_cluster_id(self) -> int:
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COALESCE(MAX(cluster_id), 0) FROM articles")
+            (max_id,) = cur.fetchone()
+        self._release(conn)
+        return max_id
+
+    def get_cluster_member_data(self, cluster_id: int) -> List[Dict]:
+        """Full membership (id, title, embedding) of a persistent cluster —
+        used to (re)generate its label from its whole history, not just
+        whichever slice of it fell inside this run's re-fit window."""
+        conn = self._connect()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, title, embedding FROM articles WHERE cluster_id=%s",
+                (cluster_id,)
+            )
+            rows = cur.fetchall()
+        self._release(conn)
+        return [{'id': r['id'], 'title': r['title'], 'embedding': bytes(r['embedding'])}
+                for r in rows]
+
+    # Allowlist, not string interpolation of caller input: `sort` reaches the
+    # ORDER BY clause, which can't be parameterised, so the *only* safe shape
+    # is mapping a known key to a fixed fragment written here.
+    _CLUSTER_SORTS = {
+        # Newest coverage first — the default news-feed reading order.
+        'latest': 'latest_at DESC NULLS LAST',
+        # Most independently-corroborated events first: how many distinct
+        # outlets carried the story, which is the better "biggest story"
+        # signal than raw article count (one outlet publishing five updates
+        # is not five outlets agreeing).
+        'sources': 'source_count DESC, article_count DESC, latest_at DESC',
+        # Most total coverage first, counting deduplicated articles.
+        'articles': 'article_count DESC, source_count DESC, latest_at DESC',
+    }
+
+    def get_clusters(self, min_size: int = 2, category: str = None,
+                     topic_id: int = None, sort: str = 'latest') -> List[Dict]:
+        conn = self._connect()
+        order_by = self._CLUSTER_SORTS.get(sort, self._CLUSTER_SORTS['latest'])
+        cat_filter = "AND a.category=%s" if category else ""
+        topic_filter = (
+            "AND a.cluster_id IN (SELECT cluster_id FROM cluster_labels WHERE topic_id=%s)"
+            if topic_id is not None else ""
+        )
+        # Order matters: both filters sit in WHERE, ahead of HAVING's %s.
+        params = []
+        if category:
+            params.append(category)
+        if topic_id is not None:
+            params.append(topic_id)
+        params.append(min_size)
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(f'''
+                SELECT
+                    a.cluster_id,
+                    COUNT(DISTINCT (a.source, LOWER(TRIM(a.title)))) as article_count,
+                    COUNT(DISTINCT a.source) as source_count,
+                    STRING_AGG(DISTINCT a.source, ',') as sources,
+                    MAX(a.published_at) as latest_at,
+                    MAX(a.title) FILTER (
+                        WHERE LENGTH(a.title) = (
+                            SELECT MAX(LENGTH(a2.title))
+                            FROM articles a2
+                            WHERE a2.cluster_id = a.cluster_id
+                        )
+                    ) as fallback_title,
+                    (SELECT a3.image_url FROM articles a3
+                     WHERE a3.cluster_id = a.cluster_id
+                       AND a3.image_url IS NOT NULL AND a3.image_url != ''
+                     ORDER BY a3.published_at DESC NULLS LAST LIMIT 1) as cluster_image,
+                    (SELECT a4.category FROM articles a4
+                     WHERE a4.cluster_id = a.cluster_id
+                       AND a4.category IS NOT NULL
+                     GROUP BY a4.category ORDER BY COUNT(*) DESC LIMIT 1) as category
+                FROM articles a
+                WHERE a.cluster_id IS NOT NULL AND a.cluster_id >= 0
+                  AND a.body IS NOT NULL AND a.body != ''
+                {cat_filter}
+                {topic_filter}
+                GROUP BY a.cluster_id
+                HAVING COUNT(DISTINCT (a.source, LOWER(TRIM(a.title)))) >= %s
+                ORDER BY {order_by}
+            ''', params)
+            rows = cur.fetchall()
+
+            cur.execute('''
+                SELECT cl.cluster_id, cl.event_title, cl.topic_id, t.topic_title
+                FROM cluster_labels cl
+                LEFT JOIN topics t ON t.topic_id = cl.topic_id
+            ''')
+            stored = {
+                r['cluster_id']: (r['event_title'], r['topic_id'], r['topic_title'])
+                for r in cur.fetchall()
+            }
+
+        self._release(conn)
+        result = []
+        for r in rows:
+            d = dict(r)
+            d['sources'] = d['sources'].split(',') if d['sources'] else []
+            cid = d['cluster_id']
+            label, tid, ttitle = stored.get(cid, (None, None, None))
+            d['event_title'] = label or d.pop('fallback_title') or ''
+            d.pop('fallback_title', None)
+            d['topic_id'] = tid
+            d['topic_title'] = ttitle
+            if d.get('latest_at') and hasattr(d['latest_at'], 'isoformat'):
+                d['latest_at'] = d['latest_at'].isoformat()
+            result.append(d)
+        return result
+
+    def get_cluster_articles(self, cluster_id: int) -> List[Dict]:
+        conn = self._connect()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, title, body, source, published_at, url, cluster_id, category, image_url "
+                "FROM articles WHERE cluster_id=%s ORDER BY published_at DESC",
+                (cluster_id,)
+            )
+            rows = cur.fetchall()
+        self._release(conn)
+        result = []
+        for r in rows:
+            d = dict(r)
+            if d.get('published_at') and hasattr(d['published_at'], 'isoformat'):
+                d['published_at'] = d['published_at'].isoformat()
+            result.append(d)
+        return result
+
+    def get_article_by_id(self, article_id: int) -> Optional[Dict]:
+        conn = self._connect()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM articles WHERE id=%s", (article_id,))
+            row = cur.fetchone()
+        self._release(conn)
+        if not row:
+            return None
+        d = dict(row)
+        for field in ('published_at', 'scraped_at'):
+            if d.get(field) and hasattr(d[field], 'isoformat'):
+                d[field] = d[field].isoformat()
+        return d
+
+    def get_articles(self, source: str = None, category: str = None,
+                     limit: int = 20, offset: int = 0) -> List[Dict]:
+        filters, params = [], []
+        if source:
+            filters.append("source=%s")
+            params.append(source)
+        if category:
+            filters.append("category=%s")
+            params.append(category)
+        where = ("WHERE " + " AND ".join(filters)) if filters else ""
+        params += [limit, offset]
+        conn = self._connect()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                f"SELECT id, title, body, source, published_at, url, cluster_id, category, scraped_at "
+                f"FROM articles {where} ORDER BY scraped_at DESC LIMIT %s OFFSET %s",
+                params
+            )
+            rows = cur.fetchall()
+        self._release(conn)
+        result = []
+        for r in rows:
+            d = dict(r)
+            for field in ('published_at', 'scraped_at'):
+                if d.get(field) and hasattr(d[field], 'isoformat'):
+                    d[field] = d[field].isoformat()
+            result.append(d)
+        return result
+
+    def get_stats(self) -> Tuple[int, Dict, Dict]:
+        try:
+            conn = self._connect()
+            with conn.cursor() as cur:
+                cur.execute('SELECT COUNT(*) FROM articles')
+                total = cur.fetchone()[0]
+                cur.execute('SELECT source, COUNT(*) FROM articles GROUP BY source')
+                by_source = dict(cur.fetchall())
+                cur.execute('SELECT category, COUNT(*) FROM articles GROUP BY category')
+                by_category = dict(cur.fetchall())
+            self._release(conn)
+            return total, by_source, by_category
+        except Exception as e:
+            logger.error(f"Error getting stats: {e}")
+            return 0, {}, {}
+
+    def get_cluster_stats(self) -> Dict:
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute('SELECT COUNT(*) FROM articles')
+            total = cur.fetchone()[0]
+            cur.execute('SELECT COUNT(*) FROM articles WHERE cluster_id IS NOT NULL AND cluster_id >= 0')
+            clustered = cur.fetchone()[0]
+            cur.execute('SELECT COUNT(DISTINCT cluster_id) FROM articles WHERE cluster_id IS NOT NULL AND cluster_id >= 0')
+            num_clusters = cur.fetchone()[0]
+        self._release(conn)
+        return {
+            'total_articles': total,
+            'clustered': clustered,
+            'unclustered': total - clustered,
+            'total_clusters': num_clusters,
+        }
+
+    def get_article_id_by_url(self, url: str) -> Optional[int]:
+        try:
+            conn = self._connect()
+            with conn.cursor() as cur:
+                cur.execute('SELECT id FROM articles WHERE url=%s', (url,))
+                row = cur.fetchone()
+            self._release(conn)
+            return row[0] if row else None
+        except Exception as e:
+            logger.error(f"Error fetching article id by url: {e}")
+            return None
+
+    # ── custom sources ─────────────────────────────────────────────────────
+
+    def add_custom_source(self, name: str, url: str) -> bool:
+        try:
+            conn = self._connect()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO custom_sources (name, url) VALUES (%s, %s) ON CONFLICT (url) DO NOTHING",
+                    (name, url)
+                )
+                saved = cur.rowcount > 0
+            conn.commit()
+            self._release(conn)
+            return saved
+        except Exception as e:
+            logger.error(f"Error adding custom source: {e}")
+            return False
+
+    def get_custom_sources(self) -> List[Dict]:
+        conn = self._connect()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, name, url, added_at, last_scraped FROM custom_sources WHERE active=1"
+            )
+            rows = cur.fetchall()
+        self._release(conn)
+        return [dict(r) for r in rows]
+
+    def delete_custom_source(self, source_id: int) -> bool:
+        try:
+            conn = self._connect()
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM custom_sources WHERE id=%s", (source_id,))
+                deleted = cur.rowcount > 0
+            conn.commit()
+            self._release(conn)
+            return deleted
+        except Exception as e:
+            logger.error(f"Error deleting custom source: {e}")
+            return False
+
+    def touch_custom_source(self, source_id: int):
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE custom_sources SET last_scraped=CURRENT_TIMESTAMP WHERE id=%s",
+                (source_id,)
+            )
+        conn.commit()
+        self._release(conn)
+
+    def reset_duplicate_bodies(self, min_occurrences: int = 2) -> int:
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute('''
+                SELECT a.id FROM articles a
+                JOIN (
+                    SELECT source, body
+                    FROM articles
+                    WHERE body IS NOT NULL AND body != '' AND LENGTH(body) >= 80
+                    GROUP BY source, body
+                    HAVING COUNT(*) >= %s
+                ) dups ON a.source = dups.source AND a.body = dups.body
+            ''', (min_occurrences,))
+            ids = [r[0] for r in cur.fetchall()]
+            if ids:
+                cur.execute(
+                    f"UPDATE articles SET body='', body_cleaned=NULL, embedding=NULL, cluster_id=NULL "
+                    f"WHERE id = ANY(%s)",
+                    (ids,)
+                )
+        conn.commit()
+        self._release(conn)
+        return len(ids)
+
+    def get_all_titles(self) -> List[Dict]:
+        conn = self._connect()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT id, title FROM articles")
+            rows = cur.fetchall()
+        self._release(conn)
+        return [dict(r) for r in rows]
+
+    def get_all_cluster_labels(self) -> List[Dict]:
+        conn = self._connect()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT cluster_id, event_title FROM cluster_labels")
+            rows = cur.fetchall()
+        self._release(conn)
+        return [dict(r) for r in rows]
+
+    # ── legacy helpers ─────────────────────────────────────────────────────
+
+    def get_recent_articles(self, limit=10):
+        return self.get_articles(limit=limit)
+
+    def get_articles_by_source(self, source, limit=20):
+        return self.get_articles(source=source, limit=limit)
+
+    def get_articles_by_category(self, category, limit=20):
+        return self.get_articles(category=category, limit=limit)
+
+    def clear_old_articles(self, days=30):
+        try:
+            conn = self._connect()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM articles WHERE scraped_at < NOW() - INTERVAL '%s days'" % int(days)
+                )
+                deleted = cur.rowcount
+            conn.commit()
+            self._release(conn)
+            return deleted
+        except Exception as e:
+            logger.error(f"Error clearing old articles: {e}")
+            return 0
