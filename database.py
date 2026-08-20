@@ -17,49 +17,102 @@ _pool = psycopg2.pool.ThreadedConnectionPool(1, 20, DATABASE_URL)
 _pool_lock = __import__('threading').Lock()
 
 
-def _get_conn():
-    """Get a live connection from the pool, recreating it if Neon has suspended."""
-    global _pool
+def _discard(pool, conn):
+    """Return a connection to its pool *closed*. Plain putconn() would hand a
+    known-broken connection straight back to the next caller."""
     try:
-        conn = _pool.getconn()
-        if conn.closed:
-            raise psycopg2.OperationalError("closed")
+        pool.putconn(conn, close=True)
+    except Exception:
         try:
-            conn.cursor().execute('SELECT 1')  # verify SSL is still alive
-        except psycopg2.OperationalError:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _rebuild_pool(stale_pool):
+    """
+    Replace the global pool, but only if nobody else already has.
+
+    Deliberately does NOT call closeall() on the old pool. closeall() shuts
+    every connection it owns — including ones other threads are mid-query on —
+    which is exactly how a single stale connection used to take out every
+    concurrent request with "cursor already closed" / "connection pointer is
+    NULL". The old pool is simply dropped; its connections close when their
+    holders release them or when it is garbage collected.
+    """
+    global _pool
+    with _pool_lock:
+        if _pool is not stale_pool:
+            return                      # another thread already rebuilt it
+        last_err = None
+        for attempt in range(3):
             try:
-                _pool.putconn(conn)
-            except Exception:
-                pass
-            raise
-        return conn
-    # PoolError ("pool is closed"/"exhausted") is a *sibling* of OperationalError,
-    # not a subclass — it must be caught separately, or a pool broken by one
-    # failure (below) raises it uncaught on every call after, forever, since
-    # nothing else ever rebuilds `_pool`. This previously took the continuous
-    # scraper down for hours with every run logged as "executed successfully"
-    # because scheduler.py catches and logs the exception per run.
-    except (psycopg2.OperationalError, psycopg2.pool.PoolError):
-        with _pool_lock:
-            try:
-                _pool.closeall()
-            except Exception:
-                pass
-            # Retry pool creation itself: if Neon is mid-wake, the first
-            # attempt can fail too. Without this, that failure would escape
-            # uncaught here and leave `_pool` closed and never replaced.
-            last_err = None
-            for attempt in range(3):
-                try:
-                    _pool = psycopg2.pool.ThreadedConnectionPool(1, 20, DATABASE_URL)
-                    last_err = None
-                    break
-                except Exception as e:
-                    last_err = e
-                    time.sleep(1.5 * (attempt + 1))
-            if last_err is not None:
-                raise last_err
-        return _pool.getconn()
+                _pool = psycopg2.pool.ThreadedConnectionPool(1, 20, DATABASE_URL)
+                logger.warning("Rebuilt the database connection pool")
+                return
+            except Exception as e:      # Neon may still be waking up
+                last_err = e
+                time.sleep(1.5 * (attempt + 1))
+        raise last_err
+
+
+def _get_conn():
+    """
+    A live connection from the pool.
+
+    Neon suspends idle databases, so pooled connections go stale and the first
+    use after a quiet period fails. The recovery is deliberately graded:
+    a stale connection is discarded *individually* and retried, and the whole
+    pool is only replaced when the pool object itself is unusable. That
+    ordering matters — the API serves requests from a thread pool, so tearing
+    down shared state to recover one connection breaks every request in flight.
+    """
+    last_err = None
+    for _ in range(3):
+        pool = _pool                    # snapshot: another thread may swap it
+        try:
+            conn = pool.getconn()
+        # PoolError ("pool is closed"/"exhausted") is a *sibling* of
+        # OperationalError, not a subclass, so it must be caught separately —
+        # otherwise a pool broken once raises uncaught on every call forever,
+        # since nothing else would ever rebuild it. That previously took the
+        # scraper down for hours, with each run logged as "executed
+        # successfully" because scheduler.py catches per-run exceptions.
+        except psycopg2.pool.PoolError as e:
+            last_err = e
+            _rebuild_pool(pool)
+            continue
+
+        if conn.closed:
+            _discard(pool, conn)
+            last_err = psycopg2.OperationalError("connection was already closed")
+            continue
+
+        try:
+            with conn.cursor() as cur:
+                cur.execute('SELECT 1')  # verify the socket is actually alive
+            return conn
+        except psycopg2.Error as e:
+            last_err = e
+            _discard(pool, conn)
+            continue
+
+    raise last_err if last_err else psycopg2.OperationalError("could not get a connection")
+
+
+def _put_conn(conn):
+    """
+    Release a connection. Tolerates the pool having been swapped underneath:
+    putconn() rejects a connection it does not own, and silently dropping it
+    would leak the socket, so it is closed instead.
+    """
+    try:
+        _pool.putconn(conn)
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 class ArticleDatabase:
@@ -71,10 +124,7 @@ class ArticleDatabase:
         return _get_conn()
 
     def _release(self, conn):
-        try:
-            _pool.putconn(conn)
-        except Exception:
-            pass
+        _put_conn(conn)
 
     def init_db(self):
         conn = self._connect()
