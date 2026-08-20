@@ -33,7 +33,10 @@ sentence-transformer model already used for article vectors. An article's
 existing embedding is then compared to each class's centroid by cosine
 similarity (embeddings are L2-normalized, so this is a dot product); the
 best match relabels the article only if it beats the current keyword-based
-label's implied class by a margin — a plain argmax would flip a lot of
+label's implied class by a margin. The exemplars are embedded through the
+same provider as the articles (see embedding_provider.py) — they must share
+a vector space or the comparison is meaningless, and _MARGIN is tuned per
+provider like every other similarity threshold — a plain argmax would flip a lot of
 genuinely-borderline articles back and forth for no real gain.
 
 This is a legitimate, standard technique (embeddings-as-zero-shot-classifier)
@@ -95,25 +98,38 @@ _EXEMPLARS = {
 # An embedding-label swap only overrides the keyword-based label when it
 # wins by at least this much — a plain argmax over three centroids flips a
 # lot of genuinely-close calls back and forth run to run for no real benefit.
-_MARGIN = 0.03
+#
+# This is a *difference* between two similarities, so it scales with how
+# spread out the space is, not with any absolute threshold. Gemini compresses
+# similarity spread roughly 3.7x versus the local model (sd 0.036 vs 0.131),
+# hence 0.008 here where the local provider used 0.03.
+import os
+_MARGIN = float(os.environ.get('CLASSIFIER_MARGIN', 0.008))
 
 _centroids = None  # lazily built: {'economics': ndarray, 'politics': ndarray, 'general': ndarray}
 
 
-def _build_centroids(model):
+def _build_centroids():
+    """
+    Embedded once per process and cached. That matters more now that the
+    provider may be a paid API: these are 32 short sentences, so the whole
+    classifier costs a single batch call per process lifetime regardless of
+    how many articles are processed.
+    """
     global _centroids
     if _centroids is not None:
         return _centroids
+    import embedding_provider
     _centroids = {}
     for label, sentences in _EXEMPLARS.items():
-        vecs = model.encode(sentences, normalize_embeddings=True, show_progress_bar=False)
+        vecs = embedding_provider.encode(sentences, task='classification')
         centroid = np.mean(vecs, axis=0)
         _centroids[label] = centroid / (np.linalg.norm(centroid) + 1e-9)
     logger.info(f"Built classifier exemplar centroids for {list(_centroids)}")
     return _centroids
 
 
-def refine_category(model, embedding: np.ndarray, keyword_category: str) -> str:
+def refine_category(embedding: np.ndarray, keyword_category: str) -> str:
     """
     Return the category to store for an article: `keyword_category` unless
     the embedding is clearly closer to a different class's exemplar centroid.
@@ -123,7 +139,7 @@ def refine_category(model, embedding: np.ndarray, keyword_category: str) -> str:
     unconditionally by a filter_keywords=False source whose actual content
     turned out not to be economics/politics after all.
     """
-    centroids = _build_centroids(model)
+    centroids = _build_centroids()
     sims = {label: float(np.dot(embedding, c)) for label, c in centroids.items()}
     best_label = max(sims, key=sims.get)
 

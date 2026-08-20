@@ -1,3 +1,14 @@
+# Core pipeline — scraper loop, clustering, and API.
+#
+# NOTE: no torch, no sentence-transformers. Embeddings come from the Gemini
+# API by default (EMBEDDING_PROVIDER=gemini), which is what keeps this
+# installable on a small host and lets /search run anywhere. Clustering
+# itself is unchanged and still needs numpy/hdbscan/scikit-learn — those are
+# classical ML with no model weights, ~150MB rather than ~1.2GB.
+#
+# To run fully offline on the local embedding model instead:
+#   pip install -r requirements-local.txt   # adds torch + sentence-transformers
+#   EMBEDDING_PROVIDER=local
 fastapi
 uvicorn[standard]
 psycopg2-binary
@@ -8,10 +19,8 @@ beautifulsoup4
 feedparser
 lxml
 trafilatura
-sentence-transformers
 hdbscan
 scikit-learn
 numpy>=2.0,<3.0
 apscheduler
-keybert         # cluster-label fallback for weak/low-quality headlines
 python-dotenv

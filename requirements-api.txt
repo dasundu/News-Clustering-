@@ -1,18 +1,24 @@
-# Lightweight requirements for a read-only API deployment (e.g. Render free
-# tier) that only ever serves /clusters, /articles, /stats etc. from an
-# already-populated database — never triggers the scrape/embed/cluster
-# pipeline itself (that runs elsewhere, against the same DATABASE_URL, using
-# the full requirements.txt).
+# Lightweight API deployment (e.g. Render free tier) serving /clusters,
+# /articles, /stats — and, now, /search.
 #
-# Deliberately excludes torch, sentence-transformers, hdbscan, trafilatura,
-# scikit-learn, and the scraping libraries (requests/bs4/feedparser/lxml) —
-# none of api.py's read routes import them, and installing them would burn
-# through a free tier's build minutes/disk for code that's never used there.
-# Run with PIPELINE_ENABLED=false so the routes that DO need those packages
-# (/pipeline/run, /submit, /sources/{id}/scrape) return a clean 503 instead
-# of crashing with an ImportError if ever called on this deployment.
+# /search used to be impossible here: embedding the incoming query needed the
+# local model in-process, i.e. torch + sentence-transformers (~1.2GB). With
+# EMBEDDING_PROVIDER=gemini the query is embedded over HTTP instead, so this
+# set only gains `requests` and `numpy` (~30MB) and the search route works on
+# the same small host as everything else. That was the main reason for
+# switching providers at all.
+#
+# Still deliberately excludes torch, sentence-transformers, hdbscan,
+# scikit-learn, trafilatura and the scraping libraries — the scrape/embed/
+# cluster loop runs elsewhere against the same database.
+#
+# Run with PIPELINE_ENABLED=false so every write route returns a clean 503.
+# Set SEARCH_ENABLED=false as well only if you do not want this host making
+# Gemini API calls.
 fastapi
 uvicorn[standard]
 psycopg2-binary
 pydantic
 python-dotenv
+requests        # Gemini embedding calls from /search
+numpy           # vector handling in embedding_provider / searcher

@@ -62,6 +62,7 @@ import numpy as np
 import requests
 import hdbscan
 from sklearn.cluster import AgglomerativeClustering
+import embedding_provider
 from database import ArticleDatabase
 from config import (
     HDBSCAN_MIN_CLUSTER, HDBSCAN_MIN_SAMPLES,
@@ -71,6 +72,7 @@ from config import (
     CLUSTER_MAX_SPAN_DAYS,
     CLUSTER_LABEL_USE_LLM, CLUSTER_LABEL_QUALITY_FLOOR, GEMINI_LABEL_MODELS,
     TOPIC_SIMILARITY_THRESHOLD, TOPIC_MATCH_THRESHOLD, TOPIC_MIN_CLUSTERS,
+    EPSILON_CLAMP_LOW, EPSILON_CLAMP_HIGH,
 )
 
 logger = logging.getLogger(__name__)
@@ -138,15 +140,24 @@ _keybert_model = None
 
 
 def _get_keybert():
-    """Lazily loaded and cached for the process lifetime — most clusters
-    never need this tier, so it shouldn't cost a model load on every run."""
+    """
+    Lazily loaded and cached for the process lifetime — most clusters never
+    need this tier, so it shouldn't cost a model load on every run.
+
+    Returns None when embeddings come from a hosted API rather than a local
+    model. KeyBERT scores hundreds of candidate n-grams per call, which is
+    fine against a resident model and wholly impractical against a
+    per-request API. Callers fall through to the next labelling tier.
+    """
     global _keybert_model
+    if not embedding_provider.is_local():
+        return None
     if _keybert_model is None:
         from keybert import KeyBERT
         from sentence_transformers import SentenceTransformer
-        from config import EMBEDDING_MODEL
-        logger.info(f"Loading KeyBERT backend ({EMBEDDING_MODEL}) for weak-title labels...")
-        _keybert_model = KeyBERT(model=SentenceTransformer(EMBEDDING_MODEL))
+        from config import LOCAL_EMBEDDING_MODEL
+        logger.info(f"Loading KeyBERT backend ({LOCAL_EMBEDDING_MODEL}) for weak-title labels...")
+        _keybert_model = KeyBERT(model=SentenceTransformer(LOCAL_EMBEDDING_MODEL))
     return _keybert_model
 
 
@@ -178,6 +189,8 @@ def _keybert_label(titles: list) -> str:
     when none of the real headlines look like a solid hard-news title."""
     try:
         kb = _get_keybert()
+        if kb is None:
+            return ''          # not available under a hosted-API provider
         text = '. '.join(t for t in titles if t)[:2000]
         if not text.strip():
             return ''
@@ -314,7 +327,7 @@ def _match_to_previous(new_centroids: dict, prev_centroids: dict,
     return matched
 
 
-def _adaptive_epsilon(matrix: np.ndarray, low: float = 0.15, high: float = 0.45,
+def _adaptive_epsilon(matrix: np.ndarray, low: float = None, high: float = None,
                        percentile: float = 25.0, sample_size: int = 500) -> float:
     """
     HDBSCAN's cluster_selection_epsilon as a percentile of this run's own
@@ -327,9 +340,15 @@ def _adaptive_epsilon(matrix: np.ndarray, low: float = 0.15, high: float = 0.45,
     (the metric this project's HDBSCAN actually uses) rather than cosine
     distance.
     """
+    # Clamp bounds are provider-specific: they are euclidean distances over
+    # unit vectors, and the whole distance scale compresses under Gemini
+    # (same-event pairs sit near 0.40 apart vs 0.68 under the local model).
+    low = EPSILON_CLAMP_LOW if low is None else low
+    high = EPSILON_CLAMP_HIGH if high is None else high
+
     n = len(matrix)
     if n < 4:
-        return 0.3  # matches the previous fixed default; too few points to estimate a percentile
+        return (low + high) / 2  # too few points to estimate a percentile
 
     if n > sample_size:
         rng = np.random.default_rng(seed=42)
@@ -342,7 +361,7 @@ def _adaptive_epsilon(matrix: np.ndarray, low: float = 0.15, high: float = 0.45,
     upper = np.triu_indices(len(sample), k=1)
     pairwise = dists[upper]
     if pairwise.size == 0:
-        return 0.3
+        return (low + high) / 2
 
     eps = float(np.percentile(pairwise, percentile))
     return float(np.clip(eps, low, high))
@@ -564,7 +583,8 @@ class ArticleClusterer:
         self.db = ArticleDatabase()
 
     def run(self) -> dict:
-        rows = self.db.get_recent_embeddings(CLUSTER_WINDOW_DAYS)
+        model_id = embedding_provider.model_id()
+        rows = self.db.get_recent_embeddings(CLUSTER_WINDOW_DAYS, model_id)
         if len(rows) < 4:
             logger.info(f"Too few embedded articles in the last "
                         f"{CLUSTER_WINDOW_DAYS}d ({len(rows)}) to cluster")
@@ -688,7 +708,8 @@ class ArticleClusterer:
         labels_by_cluster: dict = {}
         try:
             for cid in cluster_ids:
-                members = self.db.get_cluster_member_data(cid)
+                members = self.db.get_cluster_member_data(
+                    cid, embedding_provider.model_id())
                 if not members:
                     continue
                 vecs = np.stack([

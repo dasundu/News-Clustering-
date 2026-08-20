@@ -66,7 +66,10 @@ def run_pipeline(run_num=None):
     print(f"        {cleaned} articles cleaned")
 
     # ── Step 4: Embed ───────────────────────────────────────
-    print('\n  [4/5] Embedding  (paraphrase-multilingual-MiniLM-L12-v2) ...')
+    # Read from the active provider rather than hardcoded — this banner kept
+    # claiming the local model long after embeddings moved to the Gemini API.
+    import embedding_provider
+    print(f'\n  [4/5] Embedding  ({embedding_provider.model_id()}) ...')
     from embedder import ArticleEmbedder
     embedded = ArticleEmbedder().run()
     print(f"        {embedded} articles embedded")

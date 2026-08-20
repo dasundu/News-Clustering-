@@ -334,12 +334,78 @@ EXTRACT_MAX_WORKERS = 8
 LOG_LEVEL = 'INFO'
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 
+# ── Embeddings ────────────────────────────────────────────────────────────
+# Which backend turns text into vectors. See embedding_provider.py.
+#
+#   gemini  Google's hosted API. No local model, no torch — this is what
+#           makes the project deployable on a small host and lets /search
+#           run anywhere. ~$1.64/year at this project's measured rate.
+#   local   paraphrase-multilingual-MiniLM-L12-v2 in process. Offline and
+#           free, but ~1.2GB of dependencies plus a 458MB model download.
+#
+# The two produce INCOMPATIBLE vector spaces — every threshold below is
+# tuned per-provider and must be re-derived when switching. Changing this
+# also changes model_id(), which makes the next pipeline run re-embed the
+# whole corpus automatically instead of mixing spaces.
+EMBEDDING_PROVIDER = os.environ.get('EMBEDDING_PROVIDER', 'gemini').strip().lower()
+
+LOCAL_EMBEDDING_MODEL = 'paraphrase-multilingual-MiniLM-L12-v2'
+GEMINI_EMBEDDING_MODEL = os.environ.get('GEMINI_EMBEDDING_MODEL', 'gemini-embedding-001')
+
+# Vector width. 384 is fixed by the local model; Gemini supports 128-3072 via
+# Matryoshka truncation. 768 is the default: pgvector's HNSW index refuses
+# anything over 2000 dimensions (verified against this project's own Neon
+# instance), so 3072 could be stored but never indexed.
+EMBEDDING_DIMENSION = (
+    384 if EMBEDDING_PROVIDER != 'gemini'
+    else int(os.environ.get('EMBEDDING_DIMENSION', 768))
+)
+
+# Texts per batchEmbedContents call, and the pause between calls.
+#
+# MEASURED FREE-TIER LIMIT (from the API's own quota error):
+#   quotaId    EmbedContentRequestsPerDayPerUserPerProjectPerModel-FreeTier
+#   quotaValue 1000   per DAY, counted per *embedded item* — every text in a
+#                     batch spends one unit, not one per HTTP request.
+#
+# What that means here:
+#   * Ongoing operation is fine. This project ingests ~222 articles/day, well
+#     inside 1000, with room for /search queries on top.
+#   * A full backfill (currently ~3,800 articles) does NOT fit in one day. It
+#     completes on its own over ~4 days because embedder.py commits
+#     incrementally and each run resumes from where the quota cut it off —
+#     or immediately, if billing is enabled.
+# Both knobs can be relaxed once billing is on; they only pace the burst.
+GEMINI_EMBED_BATCH = int(os.environ.get('GEMINI_EMBED_BATCH', 25))
+GEMINI_EMBED_SLEEP = float(os.environ.get('GEMINI_EMBED_SLEEP', 1.0))
+
 # ── NLP pipeline ──────────────────────────────────────────────────────────
-EMBEDDING_MODEL = 'paraphrase-multilingual-MiniLM-L12-v2'
 BODY_BATCH_SIZE = 100
-EMBED_BATCH_SIZE = 256      # must exceed new articles per run or a backlog builds
+EMBED_BATCH_SIZE = int(os.environ.get('EMBED_BATCH_SIZE', 256))
+# Articles embedded and committed per sub-batch. Keeps progress durable when a
+# hosted provider rate-limits mid-run: whatever completed is already saved and
+# the next run resumes from it, rather than the whole batch being lost.
+EMBED_COMMIT_CHUNK = int(os.environ.get('EMBED_COMMIT_CHUNK', 50))
 HDBSCAN_MIN_CLUSTER = 2
 HDBSCAN_MIN_SAMPLES = 1
+
+# ── Similarity thresholds ────────────────────────────────────────────────────
+# EVERY constant below lives in cosine-similarity space and is therefore
+# specific to EMBEDDING_PROVIDER. The two spaces are wildly different — on
+# this corpus, unrelated articles score ~0.17 under the local model but
+# ~0.75 under Gemini, which is ABOVE the local model's own match threshold.
+# Carrying values across providers collapses every article into one cluster,
+# silently and with no error.
+#
+# Current defaults are the GEMINI values, derived by compare_embeddings.py:
+# each is the point in the Gemini distribution occupying the same percentile
+# the old local value held. For reference, the local-provider equivalents
+# were: MATCH 0.60, COHERENCE 0.45, MERGE 0.55, TOPIC_SIM 0.45,
+# TOPIC_MATCH 0.40, SEARCH_HIGH/LOW 0.60/0.40.
+#
+# They are distribution-derived starting points, NOT measured optima. Run
+# compare_embeddings.py after any provider change, and re-derive them
+# properly once a labeled evaluation set exists.
 
 # ── Incremental clustering ───────────────────────────────────────────────────
 # Each run re-fits HDBSCAN only on articles published within this window,
@@ -358,7 +424,22 @@ CLUSTER_WINDOW_DAYS = 14
 # HDBSCAN's own cluster_selection_epsilon=0.3 member-to-member merge radius,
 # since centroid-to-centroid similarity is naturally higher than the
 # member-pair similarities driving that merge.
-CLUSTER_MATCH_THRESHOLD = 0.60
+CLUSTER_MATCH_THRESHOLD = float(os.environ.get('CLUSTER_MATCH_THRESHOLD', 0.90))
+
+# HDBSCAN's cluster_selection_epsilon is picked per run from the data, then
+# clamped to this range. Euclidean distance over unit vectors, so it is
+# provider-specific like every similarity constant: the local model put
+# same-event pairs ~0.68 apart and used [0.15, 0.45]; Gemini compresses that
+# to ~0.40, so the clamp scales down proportionally.
+EPSILON_CLAMP_LOW = float(os.environ.get('EPSILON_CLAMP_LOW', 0.09))
+EPSILON_CLAMP_HIGH = float(os.environ.get('EPSILON_CLAMP_HIGH', 0.26))
+# MEASURED: under Gemini this knob is effectively inert. Actual pairwise
+# distances in a live window start around 0.55 (p1) with a median of 0.71,
+# far above any value in this range, so cluster_selection_epsilon never binds
+# — sweeping 0.10 to 0.32 moved the result from 70 clusters to 68. HDBSCAN's
+# density selection is doing the work. Do not spend time tuning this before
+# checking it still matters; the active levers are min_cluster_size and the
+# refinement thresholds.
 
 # ── Cluster quality refinement ───────────────────────────────────────────────
 # Post-processing applied to each run's fresh structural HDBSCAN groups,
@@ -382,7 +463,7 @@ CLUSTER_MAX_SIZE = 20
 # to their own centroid, below which the group is treated as too loose to be
 # one event and is split in two.
 # Range: [0.35, 0.55] — lower accepts looser groupings.
-CLUSTER_MIN_COHERENCE = 0.45
+CLUSTER_MIN_COHERENCE = float(os.environ.get('CLUSTER_MIN_COHERENCE', 0.83))
 
 # Recursion depth cap shared by both split triggers above.
 CLUSTER_MAX_SPLIT_DEPTH = 3
@@ -400,7 +481,7 @@ CLUSTER_MAX_DOMINANT_OUTLET_SHARE = 0.6
 # centroid cosine similarity at or above this — provided merging wouldn't
 # exceed CLUSTER_MAX_SIZE or CLUSTER_MAX_SPAN_DAYS — is merged into one
 # multi-source cluster instead of being reported as two separate ones.
-CLUSTER_MERGE_SIMILARITY_THRESHOLD = 0.55
+CLUSTER_MERGE_SIMILARITY_THRESHOLD = float(os.environ.get('CLUSTER_MERGE_SIMILARITY_THRESHOLD', 0.88))
 
 # Hard cap on how many days a single run's *structural* cluster may span.
 # This applies only to the fresh grouping computed this run, not to a
@@ -433,7 +514,18 @@ CLUSTER_MAX_SPAN_DAYS = 5
 # CLUSTER_MATCH_THRESHOLD (0.60): "same ongoing story" is a weaker bar than
 # "same event". Starting point — worth re-deriving against a labeled sample
 # the same way the event-level thresholds should be.
-TOPIC_SIMILARITY_THRESHOLD = 0.45
+# MEASURED against centroid pairs, not article pairs — the distinction
+# matters and got this wrong once. Cluster centroids are averages, so they
+# sit much closer together than individual articles do: p50=0.79, p90=0.84,
+# p99=0.89. A threshold of 0.83 is therefore only ~p85 and merged 168
+# unrelated events into one "topic" (vehicle imports + a cooperatives act +
+# coconut processing + elephants). Sweep at 663 centroids:
+#     0.83 -> 66 topics, largest 168   <- was here
+#     0.88 -> 105 topics, largest 28
+#     0.90 -> 105 topics, largest 13, covering 324 clusters
+#     0.94 -> 53 topics, largest 9, covering only 120
+# 0.90 keeps topic sizes plausible while still covering ~half the clusters.
+TOPIC_SIMILARITY_THRESHOLD = float(os.environ.get('TOPIC_SIMILARITY_THRESHOLD', 0.90))
 
 # Persistent topic identity across runs, matching a fresh topic grouping to
 # the previous run's topics by centroid similarity — the same mechanism
@@ -441,7 +533,11 @@ TOPIC_SIMILARITY_THRESHOLD = 0.45
 # TOPIC_SIMILARITY_THRESHOLD since a topic's centroid drifts as its member
 # events change, and losing topic identity is worse than holding a slightly
 # drifted one.
-TOPIC_MATCH_THRESHOLD = 0.40
+# Scaled with TOPIC_SIMILARITY_THRESHOLD, and kept just below it for the
+# same reason as at the event level: a topic's centroid drifts as its member
+# events change, and losing topic identity is worse than holding a slightly
+# drifted one.
+TOPIC_MATCH_THRESHOLD = float(os.environ.get('TOPIC_MATCH_THRESHOLD', 0.88))
 
 # How many event clusters must group together before it's presented as a
 # topic at all. Below this, a cluster keeps topic_id=NULL — a standalone
@@ -505,8 +601,8 @@ SEARCH_RRF_K = int(os.environ.get('SEARCH_RRF_K', 60))
 # the thing a confidence cutoff is read from.
 # Starting points to be calibrated against a labeled query set, exactly like
 # the clustering thresholds — see the evaluation plan.
-SEARCH_MIN_SCORE_HIGH = float(os.environ.get('SEARCH_MIN_SCORE_HIGH', 0.60))
-SEARCH_MIN_SCORE_LOW = float(os.environ.get('SEARCH_MIN_SCORE_LOW', 0.40))
+SEARCH_MIN_SCORE_HIGH = float(os.environ.get('SEARCH_MIN_SCORE_HIGH', 0.90))
+SEARCH_MIN_SCORE_LOW = float(os.environ.get('SEARCH_MIN_SCORE_LOW', 0.82))
 
 # How article-level evidence rolls up to a cluster score: 'max' (one strongly
 # matching article is enough to say the event is present) or 'mean3' (mean of

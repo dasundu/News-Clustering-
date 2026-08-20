@@ -1,17 +1,22 @@
 # embedder.py
 """
-Generates sentence embeddings for articles using sentence-transformers.
-Stores normalized float32 vectors, tagged with the model that produced
-them, as BYTEA in PostgreSQL.
+Generates sentence embeddings for articles.
+
+Which backend actually produces the vectors (a local sentence-transformer
+or Google's hosted API) is decided by embedding_provider.py — this module
+only cares that it gets back L2-normalized float32 vectors. Each stored
+vector is tagged with the provider+model that produced it, so switching
+providers re-embeds the corpus instead of silently mixing two incompatible
+vector spaces.
 """
 
 import hashlib
 import logging
 import re
 import numpy as np
-from sentence_transformers import SentenceTransformer
+import embedding_provider
 from database import ArticleDatabase
-from config import EMBEDDING_MODEL, EMBED_BATCH_SIZE, outlet_name_fragments
+from config import EMBED_BATCH_SIZE, EMBED_COMMIT_CHUNK, outlet_name_fragments
 from classifier import refine_category
 
 logger = logging.getLogger(__name__)
@@ -41,54 +46,68 @@ def _strip_outlet_names(text: str) -> str:
 class ArticleEmbedder:
     def __init__(self):
         self.db = ArticleDatabase()
-        logger.info(f"Loading embedding model: {EMBEDDING_MODEL}")
-        self.model = SentenceTransformer(EMBEDDING_MODEL)
+        # No model is loaded here any more — embedding_provider decides
+        # whether that even happens, and defers it until first use.
+        self.model_id = embedding_provider.model_id()
+        logger.info(f"Embedding provider: {self.model_id}")
 
     def run(self, batch_size: int = EMBED_BATCH_SIZE) -> int:
         # Picks up articles with no embedding yet *and* articles whose
         # stored embedding_model no longer matches EMBEDDING_MODEL, so
         # changing the model in config.py safely re-embeds everything
         # instead of leaving stale, incomparable vectors mixed in silently.
-        articles = self.db.get_articles_without_embedding(EMBEDDING_MODEL, limit=batch_size)
+        articles = self.db.get_articles_without_embedding(self.model_id, limit=batch_size)
         if not articles:
             logger.info("No articles pending embedding")
             return 0
 
         logger.info(f"Embedding {len(articles)} articles...")
 
-        texts = [self._build_text(a) for a in articles]
-        vectors = self.model.encode(
-            texts,
-            batch_size=32,
-            normalize_embeddings=True,  # L2-normalize for cosine-equivalent euclidean
-            show_progress_bar=False,
-        )
+        # Processed and committed in sub-batches rather than one shot. With a
+        # hosted provider a rate limit can cut a run short at any point; doing
+        # the work incrementally means whatever succeeded is already persisted
+        # and the next run resumes from there, instead of throwing away the
+        # entire batch. Costs nothing under the local provider.
+        done = relabeled = 0
+        dim = None
+        for start in range(0, len(articles), EMBED_COMMIT_CHUNK):
+            chunk = articles[start:start + EMBED_COMMIT_CHUNK]
+            texts = [self._build_text(a) for a in chunk]
+            try:
+                vectors = embedding_provider.encode(texts, task='document')
+            except Exception as e:
+                logger.warning(
+                    f"Embedding stopped after {done}/{len(articles)} articles: {e}"
+                )
+                break
+            dim = vectors.shape[1]
 
-        relabeled = 0
-        for article, text, vec in zip(articles, texts, vectors):
-            vec32 = vec.astype('float32')
-            blob = vec32.tobytes()
-            source_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()
-            # embedding_list mirrors the same vector into the pgvector column
-            # /search reads — written in the same statement so the two
-            # representations can never drift apart (see database.py).
-            self.db.update_embedding(article['id'], blob, EMBEDDING_MODEL,
-                                      source_hash, embedding_list=vec32.tolist())
+            for article, text, vec in zip(chunk, texts, vectors):
+                vec32 = vec.astype('float32')
+                blob = vec32.tobytes()
+                source_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()
+                # embedding_list mirrors the same vector into the pgvector
+                # column /search reads — written in the same statement so the
+                # two representations can never drift apart (see database.py).
+                self.db.update_embedding(article['id'], blob, self.model_id,
+                                          source_hash, embedding_list=vec32.tolist())
 
-            # Semantic second pass over the keyword-based category (see
-            # classifier.py) — refines economics/politics/general, never
-            # drops the article itself.
-            old_cat = article.get('category') or 'general'
-            new_cat = refine_category(self.model, vec, old_cat)
-            if new_cat != old_cat:
-                self.db.update_article_category(article['id'], new_cat)
-                relabeled += 1
+                # Semantic second pass over the keyword-based category (see
+                # classifier.py) — refines economics/politics/general, never
+                # drops the article itself.
+                old_cat = article.get('category') or 'general'
+                new_cat = refine_category(vec, old_cat)
+                if new_cat != old_cat:
+                    self.db.update_article_category(article['id'], new_cat)
+                    relabeled += 1
+                done += 1
 
         logger.info(
-            f"Embedded {len(articles)} articles (dim={vectors.shape[1]}); "
-            f"classifier relabeled {relabeled}/{len(articles)}"
+            f"Embedded {done}/{len(articles)} articles"
+            + (f" (dim={dim})" if dim else "")
+            + f"; classifier relabeled {relabeled}/{max(done,1)}"
         )
-        return len(articles)
+        return done
 
     @staticmethod
     def _build_text(article: dict) -> str:

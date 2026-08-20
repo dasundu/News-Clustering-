@@ -41,36 +41,16 @@ which outlets covered the story, not just that someone did.
 """
 
 import logging
-import threading
 from typing import Dict, List, Optional
 
+import embedding_provider
 from database import ArticleDatabase
 from config import (
-    EMBEDDING_MODEL, SEARCH_CANDIDATES, SEARCH_TOP_K, SEARCH_RRF_K,
+    SEARCH_CANDIDATES, SEARCH_TOP_K, SEARCH_RRF_K,
     SEARCH_MIN_SCORE_HIGH, SEARCH_MIN_SCORE_LOW, SEARCH_AGGREGATION,
 )
 
 logger = logging.getLogger(__name__)
-
-_model = None
-_model_lock = threading.Lock()
-
-
-def _get_model():
-    """
-    Load the sentence-transformer once per process, not once per request —
-    same lazy-singleton pattern clusterer._get_keybert() uses. Lock-guarded
-    because uvicorn serves requests from a thread pool, so two concurrent
-    first-requests could otherwise both start a ~470MB model load.
-    """
-    global _model
-    if _model is None:
-        with _model_lock:
-            if _model is None:   # re-check: another thread may have won the race
-                from sentence_transformers import SentenceTransformer
-                logger.info(f"Loading embedding model for search: {EMBEDDING_MODEL}")
-                _model = SentenceTransformer(EMBEDDING_MODEL)
-    return _model
 
 
 def _rrf_fuse(channels: List[List[Dict]], k: int) -> Dict[int, float]:
@@ -203,10 +183,7 @@ class ClaimSearcher:
         """
         from embedder import ArticleEmbedder
         prepared = ArticleEmbedder._build_text({'title': text, 'body_cleaned': ''})
-        vec = _get_model().encode(
-            prepared, normalize_embeddings=True, show_progress_bar=False
-        )
-        return vec.astype('float32').tolist()
+        return embedding_provider.encode([prepared], task='query')[0].tolist()
 
     @staticmethod
     def _aggregate(sims: List[float]) -> float:

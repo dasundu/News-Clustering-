@@ -156,8 +156,34 @@ class ArticleDatabase:
             # remember to maintain it.
             self._search_available = True
             try:
+                from config import EMBEDDING_DIMENSION
                 cur.execute('CREATE EXTENSION IF NOT EXISTS vector')
-                cur.execute('ALTER TABLE articles ADD COLUMN IF NOT EXISTS embedding_vec vector(384)')
+
+                # The column is fixed-width, so switching embedding provider
+                # (384 local vs 768 Gemini) means recreating it. Dropping is
+                # safe: vector spaces are not comparable across models, so
+                # the old values are worthless the moment the provider
+                # changes, and the embedding_model check re-embeds every
+                # article on the next run anyway.
+                cur.execute("""
+                    SELECT atttypmod FROM pg_attribute
+                    WHERE attrelid = 'articles'::regclass AND attname = 'embedding_vec'
+                """)
+                row = cur.fetchone()
+                existing_dim = (row[0] if row else None)
+                if existing_dim is not None and existing_dim != EMBEDDING_DIMENSION:
+                    logger.warning(
+                        f"embedding_vec is vector({existing_dim}) but the configured "
+                        f"provider needs vector({EMBEDDING_DIMENSION}) — recreating the "
+                        f"column; articles will be re-embedded automatically."
+                    )
+                    cur.execute('DROP INDEX IF EXISTS idx_articles_vec')
+                    cur.execute('ALTER TABLE articles DROP COLUMN IF EXISTS embedding_vec')
+
+                cur.execute(
+                    f'ALTER TABLE articles ADD COLUMN IF NOT EXISTS '
+                    f'embedding_vec vector({EMBEDDING_DIMENSION})'
+                )
                 cur.execute('''
                     CREATE INDEX IF NOT EXISTS idx_articles_vec ON articles
                     USING hnsw (embedding_vec vector_cosine_ops)
@@ -704,7 +730,7 @@ class ArticleDatabase:
         self._release(conn)
         return [(r['id'], bytes(r['embedding'])) for r in rows]
 
-    def get_recent_embeddings(self, days: int) -> List[Dict]:
+    def get_recent_embeddings(self, days: int, embedding_model: str = None) -> List[Dict]:
         """
         Embedded articles from the last `days`, with whatever cluster_id they
         already carry (NULL/-1 for none). Used by the clusterer to re-fit only
@@ -721,8 +747,9 @@ class ArticleDatabase:
                        COALESCE(published_at, scraped_at) AS effective_date
                 FROM articles
                 WHERE embedding IS NOT NULL
+                  AND (%s IS NULL OR embedding_model = %s)
                   AND COALESCE(published_at, scraped_at) >= NOW() - (%s || ' days')::interval
-            """, (days,))
+            """, (embedding_model, embedding_model, days))
             rows = cur.fetchall()
         self._release(conn)
         return [
@@ -742,15 +769,22 @@ class ArticleDatabase:
         self._release(conn)
         return max_id
 
-    def get_cluster_member_data(self, cluster_id: int) -> List[Dict]:
+    def get_cluster_member_data(self, cluster_id: int,
+                                 embedding_model: str = None) -> List[Dict]:
         """Full membership (id, title, embedding) of a persistent cluster —
         used to (re)generate its label from its whole history, not just
-        whichever slice of it fell inside this run's re-fit window."""
+        whichever slice of it fell inside this run's re-fit window.
+
+        Same single-model filter as get_recent_embeddings, and for the same
+        reason: a cluster's history can straddle a provider change, and these
+        vectors get stacked."""
         conn = self._connect()
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
-                "SELECT id, title, embedding FROM articles WHERE cluster_id=%s",
-                (cluster_id,)
+                "SELECT id, title, embedding FROM articles "
+                "WHERE cluster_id=%s AND embedding IS NOT NULL "
+                "AND (%s IS NULL OR embedding_model = %s)",
+                (cluster_id, embedding_model, embedding_model)
             )
             rows = cur.fetchall()
         self._release(conn)
