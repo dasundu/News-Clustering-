@@ -1,7 +1,7 @@
-# backend/Dockerfile — full image: scraper loop (main.py) or full API server
-# (main.py --api). Needs the full requirements.txt (torch,
-# sentence-transformers, hdbscan, trafilatura, ...) since either mode can
-# reach the embedding/clustering code paths.
+# backend/Dockerfile — full image: the pipeline (scrape/extract/clean/embed/
+# cluster) and/or the API. Installs the full requirements.txt (hdbscan,
+# scikit-learn, trafilatura, ...) since either mode can reach the clustering
+# code paths. No torch: embeddings come from the Gemini API by default.
 #
 # Build from backend/ itself — the frontend is a fully independent Next.js
 # app now (its own process, its own Dockerfile), not something this image
@@ -49,4 +49,8 @@ EXPOSE 8000
 # service (`python main.py` for the scraper loop, `python main.py --api`
 # for the API server). This default just makes `docker run <image>` with no
 # override do *something* sensible standalone.
-CMD ["python", "main.py", "--api"]
+# Overridden per deployment:
+#   API            uvicorn api:app --host 0.0.0.0 --port $PORT
+#   one pipeline   python pipeline.py        (Cloud Run Job / cron)
+#   scheduler loop python main.py            (always-on host)
+CMD uvicorn api:app --host 0.0.0.0 --port ${PORT:-8000}

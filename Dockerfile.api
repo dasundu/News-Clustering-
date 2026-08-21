@@ -27,6 +27,8 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONIOENCODING=utf-8 \
     PIPELINE_ENABLED=false
 
+# Cloud Run (and most PaaS) inject the port to listen on as $PORT and health-
+# check that port — a hardcoded 8000 fails to start there. Shell form so the
+# variable is expanded at runtime, defaulting to 8000 for local/compose use.
 EXPOSE 8000
-
-CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD uvicorn api:app --host 0.0.0.0 --port ${PORT:-8000}
