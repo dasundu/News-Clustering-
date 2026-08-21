@@ -256,17 +256,21 @@ class ArticleSummary(BaseModel):
     id: int
     title: str
     source: str
-    category: Optional[str]
+    category: Optional[str] = None
     published_at: Optional[Any] = None
     url: str
-    cluster_id: Optional[int]
-    body_preview: Optional[str]
+    cluster_id: Optional[int] = None
+    # Defaults matter here: in pydantic v2 `Optional[str]` WITHOUT a default is
+    # a *required* field that merely accepts None. Any route returning rows
+    # that don't carry the key therefore 500s on response validation —
+    # /articles/{id} and /clusters/{id}/articles both did, on every call.
+    body_preview: Optional[str] = None
 
     @field_serializer('published_at')
     def _pub(self, v): return _dt_str(v)
 
 class ArticleFull(ArticleSummary):
-    body: Optional[str]
+    body: Optional[str] = None
     scraped_at: Optional[Any] = None
 
     @field_serializer('scraped_at')
@@ -279,7 +283,7 @@ class ArticleInCluster(BaseModel):
     source: str
     url: str
     published_at: Optional[Any] = None
-    body: Optional[str]
+    body: Optional[str] = None
     image_url: Optional[str] = None
 
     @field_serializer('published_at')
@@ -576,7 +580,7 @@ def cluster_articles(cluster_id: int):
     articles = db.get_cluster_articles(cluster_id)
     if not articles:
         raise HTTPException(status_code=404, detail="Cluster not found")
-    return articles
+    return [_to_summary(a) for a in articles]
 
 
 @app.get("/articles", response_model=List[ArticleSummary])
@@ -597,7 +601,7 @@ def get_article(article_id: int):
     article = db.get_article_by_id(article_id)
     if not article:
         raise HTTPException(status_code=404, detail="Article not found")
-    return article
+    return _to_summary(article)
 
 
 @app.get("/stats", response_model=Stats)
