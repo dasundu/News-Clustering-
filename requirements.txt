@@ -6,9 +6,15 @@
 # itself is unchanged and still needs numpy/hdbscan/scikit-learn — those are
 # classical ML with no model weights, ~150MB rather than ~1.2GB.
 #
-# To run fully offline on the local embedding model instead:
-#   pip install -r requirements-local.txt   # adds torch + sentence-transformers
+# The local embedding path (EMBEDDING_PROVIDER=local) is still in the code
+# but its dependencies are deliberately NOT shipped — they add ~1.2GB plus a
+# 458MB model download, which is exactly what moving to the hosted API
+# removed. To use it anyway, for offline work or a deterministic evaluation
+# run, install them explicitly:
+#   pip install sentence-transformers keybert
 #   EMBEDDING_PROVIDER=local
+# Switching provider re-embeds the corpus and invalidates every similarity
+# threshold in config.py — run compare_embeddings.py afterwards.
 fastapi
 uvicorn[standard]
 psycopg2-binary

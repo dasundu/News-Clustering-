@@ -8,7 +8,7 @@ Run (from backend/): python main.py --api
 Docs: http://localhost:8000/docs
 """
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_serializer
 from typing import Any, List, Optional
@@ -315,6 +315,12 @@ class ClusterDetail(ClusterSummary):
     cluster_image: Optional[str] = None
     articles: List[ArticleInCluster]
 
+
+class ClusterWithArticles(ClusterSummary):
+    """A cluster plus a capped preview of its articles, so a feed can be
+    rendered from one request instead of one per cluster."""
+    articles: List[ArticleInCluster] = []
+
 class TopicSummary(BaseModel):
     model_config = {'arbitrary_types_allowed': True}
     topic_id: int
@@ -496,14 +502,85 @@ def get_topic(topic_id: int):
     }
 
 
-@app.get("/clusters", response_model=List[ClusterSummary])
+class ClusterFeed(BaseModel):
+    """Response for /feed — everything a consumer needs in one object."""
+    next_id: int
+    count: int
+    clusters: List[ClusterWithArticles]
+
+
+# Defined BEFORE /clusters/{cluster_id}: FastAPI matches routes in
+# declaration order, and that one types its parameter as int, so a literal
+# path segment declared after it would fail validation rather than fall
+# through.
+@app.get("/feed", response_model=ClusterFeed)
+def feed(since_id: int = Query(0, ge=0, description="Pass 0 the first time, "
+                                                    "then the next_id you got back.")):
+    """
+    Every event with its articles, in one call.
+
+    Built for other components (bias detection, fact checking) rather than
+    for a UI: no filters to choose, full article text included, and a
+    watermark returned in the body so a caller does not have to read headers
+    or track anything itself.
+
+    `since_id` is an ARTICLE id, not a cluster id, and that distinction is
+    the point. Cluster ids persist on purpose — a cluster keeps its id when a
+    fourth outlet joins it tomorrow — so paging by cluster id would report
+    "nothing new" for precisely the update a cross-outlet consumer most wants.
+    Article ids are SERIAL and append-only, so this catches both new events
+    and new coverage of existing ones.
+
+    Matched clusters come back with ALL their articles, not only the new
+    ones, so the caller can re-compare an event across every outlet that has
+    covered it.
+    """
+    clusters = db.get_clusters(min_size=1, min_sources=2, sort='latest',
+                               since_id=since_id)
+    by_cluster = db.get_articles_for_clusters(
+        [c['cluster_id'] for c in clusters], per_cluster=50, full_body=True)
+    for c in clusters:
+        c['articles'] = by_cluster.get(c['cluster_id'], [])
+    return {
+        'next_id': db.get_max_article_id(),
+        'count': len(clusters),
+        'clusters': clusters,
+    }
+
+
+@app.get("/clusters", response_model=List[ClusterWithArticles],
+         response_model_exclude_none=False)
 def list_clusters(
     min_size: int = Query(2, ge=1),
+    min_sources: int = Query(
+        1, ge=1,
+        description="Minimum distinct outlets. The feed passes 2 so a single "
+                    "outlet's own related stories don't read as a covered event."),
     category: Optional[str] = Query(None, description="Filter by category: economics or politics"),
     topic_id: Optional[int] = Query(None, description="Only clusters filed under this topic"),
     sort: str = Query('latest', pattern='^(latest|sources|articles)$',
                       description="latest = newest first; sources = most outlets first; "
                                   "articles = most articles first"),
+    include_articles: bool = Query(
+        False, description="Embed each cluster's articles in the response, so "
+                           "a feed needs one request instead of one per cluster."),
+    articles_per_cluster: int = Query(10, ge=1, le=50),
+    full_body: bool = Query(
+        False, description="Return each article's FULL text instead of a "
+                           "400-character preview. For bias / fact-check "
+                           "consumers that need the actual wording."),
+    limit: Optional[int] = Query(None, ge=1, le=200,
+                                 description="Cap how many clusters are returned."),
+    offset: int = Query(0, ge=0,
+                        description="Skip this many clusters. With `limit`, "
+                                    "lets a consumer page through the whole corpus."),
+    since_id: int = Query(
+        0, ge=0,
+        description="Only clusters containing an article newer than this "
+                    "ARTICLE id. Pass back the X-Max-Article-Id header from "
+                    "your last call to fetch just what changed since then — "
+                    "including new outlets joining events you already have."),
+    response: Response = None,
 ):
     """
     List event clusters.
@@ -513,8 +590,26 @@ def list_clusters(
     signal than raw article count, since one outlet posting five updates
     isn't five outlets independently corroborating.
     """
-    return db.get_clusters(min_size=min_size, category=category,
-                           topic_id=topic_id, sort=sort)
+    clusters = db.get_clusters(min_size=min_size, min_sources=min_sources,
+                               category=category, topic_id=topic_id, sort=sort,
+                               since_id=since_id)
+    if response is not None:
+        # The watermark for the next incremental call. Returned as a header so
+        # the response body stays a plain list and existing clients are
+        # unaffected.
+        response.headers['X-Max-Article-Id'] = str(db.get_max_article_id())
+    total = len(clusters)
+    clusters = clusters[offset:offset + limit] if limit else clusters[offset:]
+    if not include_articles:
+        return clusters
+
+    # One extra query for ALL of them, not one per cluster.
+    by_cluster = db.get_articles_for_clusters(
+        [c['cluster_id'] for c in clusters], per_cluster=articles_per_cluster,
+        full_body=full_body)
+    for c in clusters:
+        c['articles'] = by_cluster.get(c['cluster_id'], [])
+    return clusters
 
 
 @app.get("/clusters/{cluster_id}", response_model=ClusterDetail)
@@ -560,10 +655,18 @@ def get_cluster(cluster_id: int):
     ]
 
     topic = db.get_topic_for_cluster(cluster_id)
+    # Majority category across members. Without this the field was absent
+    # from the response entirely, and the frontend's `category ?? "general"`
+    # fallback labelled every cluster GENERAL — including all-politics ones.
+    counts: dict = {}
+    for a in articles:
+        if a.get('category'):
+            counts[a['category']] = counts.get(a['category'], 0) + 1
 
     return {
         'cluster_id': cluster_id,
         'event_title': event_title,
+        'category': max(counts, key=counts.get) if counts else None,
         'article_count': len(articles),
         'sources': sources,
         'latest_at': latest_at,

@@ -192,7 +192,34 @@ class ArticleDatabase:
                 )
             ''')
             cur.execute('ALTER TABLE cluster_labels ADD COLUMN IF NOT EXISTS topic_id INTEGER')
+            # Fingerprint of a topic's member cluster ids. Relabelling is the
+            # only expensive part of the topic pass (it calls an LLM), so it
+            # runs only when this changes rather than every cycle.
+            cur.execute('ALTER TABLE topics ADD COLUMN IF NOT EXISTS member_hash TEXT')
             cur.execute('CREATE INDEX IF NOT EXISTS idx_cluster_labels_topic ON cluster_labels(topic_id)')
+            # Remembered LLM answers for topic joins. The model is not
+            # deterministic, so re-asking a settled question every run made
+            # topic membership flap; this makes an answer stick until the
+            # topic itself changes. See get_join_verdicts.
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS cluster_member_checks (
+                    article_id  INTEGER NOT NULL,
+                    peers_hash  TEXT    NOT NULL,
+                    verdict     BOOLEAN NOT NULL,
+                    checked_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (article_id, peers_hash)
+                )
+            ''')
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS topic_join_checks (
+                    cluster_id  INTEGER NOT NULL,
+                    topic_id    INTEGER NOT NULL,
+                    member_hash TEXT    NOT NULL,
+                    verdict     BOOLEAN NOT NULL,
+                    checked_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (cluster_id, topic_id, member_hash)
+                )
+            ''')
 
             # ── Claim retrieval (/search) ──────────────────────────────────
             # Additive only: `embedding` BYTEA stays the source of truth that
@@ -445,6 +472,31 @@ class ArticleDatabase:
         conn.commit()
         self._release(conn)
 
+    def save_cluster_labels_bulk(self, labels: List[Tuple[int, str]]):
+        """save_cluster_label for many clusters in one round trip.
+
+        Same reason as get_cluster_members_bulk: once single-outlet stories
+        became their own clusters, a run labels ~850 clusters instead of
+        ~320, and against a hosted database the per-statement latency
+        dominates.
+        """
+        if not labels:
+            return
+        conn = self._connect()
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_values(
+                cur,
+                'INSERT INTO cluster_labels (cluster_id, event_title, updated_at) '
+                'VALUES %s '
+                'ON CONFLICT (cluster_id) DO UPDATE '
+                'SET event_title=EXCLUDED.event_title, updated_at=CURRENT_TIMESTAMP',
+                [(cid, title, ) for cid, title in labels],
+                template='(%s, %s, CURRENT_TIMESTAMP)',
+                page_size=500,
+            )
+        conn.commit()
+        self._release(conn)
+
     def get_cluster_labels(self) -> dict:
         conn = self._connect()
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -467,29 +519,128 @@ class ArticleDatabase:
         self._release(conn)
         return {r['cluster_id']: r['topic_id'] for r in rows}
 
-    def create_topic(self, title: str) -> int:
+    def create_topic(self, title: str, member_hash: str = None) -> int:
         """Mint a new topic id. SERIAL rather than MAX(topic_id)+1 so two
         concurrent callers can't be handed the same id."""
         conn = self._connect()
         with conn.cursor() as cur:
             cur.execute(
-                'INSERT INTO topics (topic_title) VALUES (%s) RETURNING topic_id',
-                (title,)
+                'INSERT INTO topics (topic_title, member_hash) VALUES (%s, %s) RETURNING topic_id',
+                (title, member_hash)
             )
             (topic_id,) = cur.fetchone()
         conn.commit()
         self._release(conn)
         return topic_id
 
-    def update_topic_title(self, topic_id: int, title: str):
+    def update_topic_title(self, topic_id: int, title: str, member_hash: str = None):
         conn = self._connect()
         with conn.cursor() as cur:
             cur.execute(
-                'UPDATE topics SET topic_title=%s, updated_at=CURRENT_TIMESTAMP WHERE topic_id=%s',
-                (title, topic_id)
+                'UPDATE topics SET topic_title=%s, member_hash=COALESCE(%s, member_hash), '
+                'updated_at=CURRENT_TIMESTAMP WHERE topic_id=%s',
+                (title, member_hash, topic_id)
             )
         conn.commit()
         self._release(conn)
+
+    def get_member_verdicts(self) -> Dict[Tuple[int, str], bool]:
+        """Remembered answers to "does article X belong in this cluster?",
+        keyed by (article_id, fingerprint of the siblings it was shown with).
+
+        Same reasoning as get_join_verdicts: the model does not answer
+        identically twice, and cluster membership flapping every run would
+        move article and outlet counts with no news behind it.
+        """
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute('SELECT article_id, peers_hash, verdict FROM cluster_member_checks')
+            rows = cur.fetchall()
+        self._release(conn)
+        return {(r[0], r[1]): r[2] for r in rows}
+
+    def save_member_verdicts(self, verdicts: List[Tuple[int, str, bool]]):
+        if not verdicts:
+            return
+        conn = self._connect()
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_values(
+                cur,
+                'INSERT INTO cluster_member_checks '
+                '(article_id, peers_hash, verdict, checked_at) VALUES %s '
+                'ON CONFLICT (article_id, peers_hash) DO UPDATE '
+                'SET verdict=EXCLUDED.verdict, checked_at=CURRENT_TIMESTAMP',
+                verdicts,
+                template='(%s, %s, %s, CURRENT_TIMESTAMP)',
+                page_size=500,
+            )
+        conn.commit()
+        self._release(conn)
+
+    def get_join_verdicts(self) -> Dict[Tuple[int, int, str], bool]:
+        """
+        Remembered answers to "does cluster X belong in topic Y, as topic Y
+        currently stands?", keyed by (cluster_id, topic_id, member_hash).
+
+        Without this the join stage re-asked the same ~380 questions every
+        run, and the model does not answer identically every time — observed
+        across consecutive hourly runs with no new articles at all:
+        150, 142, 117, 109, 106, 102, 96, 90 accepted out of the same ~381.
+        Topic membership was churning purely from LLM non-determinism.
+
+        member_hash is part of the key so a topic that GAINS or LOSES a core
+        member is re-asked; a topic that has not changed is not.
+        """
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute('SELECT cluster_id, topic_id, member_hash, verdict '
+                        'FROM topic_join_checks')
+            rows = cur.fetchall()
+        self._release(conn)
+        return {(r[0], r[1], r[2]): r[3] for r in rows}
+
+    def save_join_verdicts(self, verdicts: List[Tuple[int, int, str, bool]]):
+        if not verdicts:
+            return
+        conn = self._connect()
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_values(
+                cur,
+                'INSERT INTO topic_join_checks '
+                '(cluster_id, topic_id, member_hash, verdict, checked_at) VALUES %s '
+                'ON CONFLICT (cluster_id, topic_id, member_hash) DO UPDATE '
+                'SET verdict=EXCLUDED.verdict, checked_at=CURRENT_TIMESTAMP',
+                verdicts,
+                template='(%s, %s, %s, %s, CURRENT_TIMESTAMP)',
+                page_size=500,
+            )
+        conn.commit()
+        self._release(conn)
+
+    def prune_join_verdicts(self, keep_days: int = 30) -> int:
+        """Drop answers about topics that no longer exist, and stale rows.
+        Bounded maintenance so this table cannot grow without limit."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM topic_join_checks
+                WHERE topic_id NOT IN (SELECT topic_id FROM topics)
+                   OR checked_at < CURRENT_TIMESTAMP - make_interval(days => %s)
+            """, (keep_days,))
+            n = cur.rowcount
+        conn.commit()
+        self._release(conn)
+        return n
+
+    def get_topic_member_hashes(self) -> Dict[int, str]:
+        """{topic_id: member_hash} — lets the topic pass skip relabelling
+        topics whose membership is unchanged since last run."""
+        conn = self._connect()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute('SELECT topic_id, member_hash FROM topics WHERE member_hash IS NOT NULL')
+            rows = cur.fetchall()
+        self._release(conn)
+        return {r['topic_id']: r['member_hash'] for r in rows}
 
     def set_cluster_topics(self, assignments: List[Tuple[Optional[int], int]]):
         """Bulk (topic_id, cluster_id) writes. topic_id=None clears a
@@ -752,7 +903,16 @@ class ArticleDatabase:
     def get_articles_without_embedding(self, current_model: str, limit: int = 500) -> List[Dict]:
         """
         Articles with no embedding yet, *or* whose stored embedding_model
-        doesn't match current_model — the latter is what makes changing
+        doesn't match current_model.
+
+        Body-less articles are excluded. `body_fetched=1` only means
+        extraction was *attempted* — when it failed, the article would be
+        embedded on its title alone, and a title-only vector is weak enough
+        that it pollutes clustering rather than helping it. Such articles
+        stay in the table (the URL record still prevents re-scraping) but
+        never reach a cluster.
+
+        The rest of the docstring — the latter is what makes changing
         EMBEDDING_MODEL in config.py safe: every article is automatically
         picked up for re-embedding under the new model on the next run,
         instead of silently keeping a stale vector from a different,
@@ -763,7 +923,7 @@ class ArticleDatabase:
             cur.execute(
                 "SELECT id, title, category, COALESCE(body_cleaned, '') as body_cleaned "
                 "FROM articles "
-                "WHERE body_fetched=1 "
+                "WHERE body_fetched=1 AND body IS NOT NULL AND body <> '' "
                 "AND (embedding IS NULL OR embedding_model IS DISTINCT FROM %s) "
                 "LIMIT %s",
                 (current_model, limit)
@@ -793,10 +953,11 @@ class ArticleDatabase:
         conn = self._connect()
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
-                SELECT id, embedding, cluster_id, source,
+                SELECT id, title, embedding, cluster_id, source,
                        COALESCE(published_at, scraped_at) AS effective_date
                 FROM articles
                 WHERE embedding IS NOT NULL
+                  AND body IS NOT NULL AND body <> ''
                   AND (%s IS NULL OR embedding_model = %s)
                   AND COALESCE(published_at, scraped_at) >= NOW() - (%s || ' days')::interval
             """, (embedding_model, embedding_model, days))
@@ -811,6 +972,16 @@ class ArticleDatabase:
             for r in rows
         ]
 
+    def get_max_article_id(self) -> int:
+        """Highest article id in the table — the watermark a consumer passes
+        back as `since_id` to fetch only what has changed since."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute('SELECT COALESCE(MAX(id), 0) FROM articles')
+            n = cur.fetchone()[0]
+        self._release(conn)
+        return int(n)
+
     def get_max_cluster_id(self) -> int:
         conn = self._connect()
         with conn.cursor() as cur:
@@ -818,6 +989,109 @@ class ArticleDatabase:
             (max_id,) = cur.fetchone()
         self._release(conn)
         return max_id
+
+    def get_all_cluster_embeddings(self, embedding_model: str) -> List[Dict]:
+        """
+        (cluster_id, embedding) for every clustered article in one query, so
+        the topic pass can build a centroid for EVERY cluster rather than
+        only the ones inside the current clustering window.
+
+        Why that matters: a topic is a *relationship between events*, and it
+        is recomputed under whatever thresholds are configured now. Leaving
+        out-of-window clusters untouched froze their topic_id at whatever an
+        older threshold decided — 48% of assignments were such fossils, which
+        is why changing the linkage appeared to have no effect on them.
+        """
+        conn = self._connect()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT cluster_id, embedding FROM articles
+                WHERE cluster_id IS NOT NULL AND cluster_id >= 0
+                  AND embedding IS NOT NULL
+                  AND body IS NOT NULL AND body <> ''
+                  AND embedding_model = %s
+            """, (embedding_model,))
+            rows = cur.fetchall()
+        self._release(conn)
+        return [{'cluster_id': r['cluster_id'], 'embedding': bytes(r['embedding'])}
+                for r in rows]
+
+    def get_articles_for_clusters(self, cluster_ids: List[int],
+                                  per_cluster: int = 10,
+                                  full_body: bool = False) -> Dict[int, List[Dict]]:
+        """Articles for many clusters in ONE query, newest first, capped per
+        cluster.
+
+        Exists so /clusters?include=articles stays two queries no matter how
+        many clusters are returned. Looping get_cluster_articles() would be
+        one round trip per cluster — the classic N+1 — and against a hosted
+        database the latency, not the work, would dominate the response.
+
+        The cap is applied in SQL with a window function rather than by
+        fetching everything and slicing in Python, so a cluster with 200
+        articles does not pull 200 rows over the wire to show 10.
+        """
+        if not cluster_ids:
+            return {}
+        conn = self._connect()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Full text is opt-in: a bias/fact-check consumer needs the real
+            # wording, but a feed rendering 20 clusters does not want 200
+            # full articles on the wire.
+            body_expr = ("COALESCE(a.body_cleaned, a.body, '')" if full_body
+                         else "LEFT(COALESCE(a.body_cleaned, a.body, ''), 400)")
+            cur.execute(f"""
+                SELECT * FROM (
+                    SELECT a.cluster_id, a.id, a.title, a.source, a.url,
+                           a.published_at, a.image_url,
+                           {body_expr} AS body,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY a.cluster_id
+                               ORDER BY a.published_at DESC NULLS LAST, a.id DESC
+                           ) AS rn
+                    FROM articles a
+                    WHERE a.cluster_id = ANY(%s)
+                      AND a.body IS NOT NULL AND a.body <> ''
+                ) t WHERE rn <= %s
+            """, (list(cluster_ids), per_cluster))
+            rows = cur.fetchall()
+        self._release(conn)
+        out: Dict[int, List[Dict]] = {}
+        for r in rows:
+            out.setdefault(r['cluster_id'], []).append({
+                'id': r['id'], 'title': r['title'], 'source': r['source'],
+                'url': r['url'], 'published_at': r['published_at'],
+                'image_url': r['image_url'], 'body': r['body'],
+            })
+        return out
+
+    def get_cluster_members_bulk(self, cluster_ids: List[int],
+                                 embedding_model: str = None) -> Dict[int, List[Dict]]:
+        """get_cluster_member_data for many clusters in ONE round trip.
+
+        Labelling used to issue a query per cluster. That was fine at ~320
+        clusters a run, but promoting single-outlet stories to their own
+        clusters roughly triples the count, and against a hosted Postgres the
+        per-query latency — not the query itself — becomes the dominant cost
+        of a run.
+        """
+        if not cluster_ids:
+            return {}
+        conn = self._connect()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT cluster_id, id, title, embedding FROM articles "
+                "WHERE cluster_id = ANY(%s) AND embedding IS NOT NULL "
+                "AND (%s IS NULL OR embedding_model = %s)",
+                (list(cluster_ids), embedding_model, embedding_model)
+            )
+            rows = cur.fetchall()
+        self._release(conn)
+        out: Dict[int, List[Dict]] = {}
+        for r in rows:
+            out.setdefault(r['cluster_id'], []).append(
+                {'id': r['id'], 'title': r['title'], 'embedding': bytes(r['embedding'])})
+        return out
 
     def get_cluster_member_data(self, cluster_id: int,
                                  embedding_model: str = None) -> List[Dict]:
@@ -857,7 +1131,13 @@ class ArticleDatabase:
     }
 
     def get_clusters(self, min_size: int = 2, category: str = None,
-                     topic_id: int = None, sort: str = 'latest') -> List[Dict]:
+                     topic_id: int = None, sort: str = 'latest',
+                     min_sources: int = 1, since_id: int = 0) -> List[Dict]:
+        """min_size counts distinct ARTICLES, min_sources counts distinct
+        OUTLETS. They are not interchangeable: one outlet publishing three
+        related pieces satisfies min_size=2 while showing a single outlet
+        badge, which reads on the feed as a lone story rather than an event
+        several papers covered."""
         conn = self._connect()
         order_by = self._CLUSTER_SORTS.get(sort, self._CLUSTER_SORTS['latest'])
         cat_filter = "AND a.category=%s" if category else ""
@@ -872,6 +1152,15 @@ class ArticleDatabase:
         if topic_id is not None:
             params.append(topic_id)
         params.append(min_size)
+        params.append(min_sources)
+        # Incremental sync, keyed on ARTICLE id rather than cluster id.
+        # Cluster ids persist deliberately — a cluster keeps its id when a
+        # new outlet joins it — so paging by cluster id would silently miss
+        # exactly the updates a consumer most wants: another paper covering
+        # a story it already has. Article ids are SERIAL and append-only, so
+        # "this cluster has an article newer than X" catches both brand new
+        # events and new coverage of old ones.
+        params.append(since_id)
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(f'''
                 SELECT
@@ -902,6 +1191,8 @@ class ArticleDatabase:
                 {topic_filter}
                 GROUP BY a.cluster_id
                 HAVING COUNT(DISTINCT (a.source, LOWER(TRIM(a.title)))) >= %s
+                   AND COUNT(DISTINCT a.source) >= %s
+                   AND MAX(a.id) > %s
                 ORDER BY {order_by}
             ''', params)
             rows = cur.fetchall()

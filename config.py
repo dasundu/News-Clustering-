@@ -65,10 +65,25 @@ def classify_category(text: str) -> Optional[str]:
     return None
 
 
+# Default ceiling on how many articles one source contributes per run. A
+# source can lower it with a `max_articles` key — see the four capped below.
+SOURCE_ARTICLE_CAP = int(os.environ.get('SOURCE_ARTICLE_CAP', 50))
+
 # ── News sources ───────────────────────────────────────────────────────────
 # filter_keywords=False  →  all articles from this source are kept as-is
 # filter_keywords=True   →  only articles matching ECONOMICS/POLITICS keywords
 #                            are kept; others are discarded
+#
+# NOW FALSE EVERYWHERE. The gate tested each HEADLINE independently, and
+# outlets word the same event differently — "Fuel prices revised" carries no
+# keyword while "...to ease inflation" does. Measured against the existing
+# multi-outlet clusters, applying the gate to all sources would have stripped
+# outlets from 29% of them and pushed 24% below two outlets entirely, which
+# is the difference between an event being usable for cross-outlet
+# comparison and not. It also throttled the largest general outlets to
+# almost nothing (Newsfirst: 60 articles, against 839 from one business
+# site). articles.category still records economics/politics/general, so the
+# distinction is kept where it belongs — as a label, not as a gate.
 
 NEWS_SOURCES = {
 
@@ -84,6 +99,7 @@ NEWS_SOURCES = {
         'description': 'EconomyNext — economic news',
     },
     'lankabusinessonline': {
+        'max_articles': 12,
         'url': 'https://www.lankabusinessonline.com',
         'rss': None,
         'type': 'html',
@@ -102,6 +118,7 @@ NEWS_SOURCES = {
         'description': 'Daily FT — Sri Lanka business newspaper',
     },
     'business_today': {
+        'max_articles': 12,
         'url': 'https://www.businesstoday.lk',
         'rss': None,
         'type': 'html',
@@ -118,7 +135,7 @@ NEWS_SOURCES = {
         'rss': None,
         'type': 'html',
         'category': 'general',
-        'filter_keywords': True,
+        'filter_keywords': False,
         'priority': 'HIGH',
         'description': 'Ada Derana — general breaking news',
     },
@@ -127,7 +144,7 @@ NEWS_SOURCES = {
         'rss': None,
         'type': 'html',
         'category': 'general',
-        'filter_keywords': True,
+        'filter_keywords': False,
         'priority': 'HIGH',
         'description': 'News First — general 24/7 news',
     },
@@ -136,7 +153,7 @@ NEWS_SOURCES = {
         'rss': None,
         'type': 'html',
         'category': 'general',
-        'filter_keywords': True,
+        'filter_keywords': False,
         'priority': 'HIGH',
         'description': 'Daily Mirror — general news',
     },
@@ -145,7 +162,7 @@ NEWS_SOURCES = {
         'rss': None,
         'type': 'html',
         'category': 'general',
-        'filter_keywords': True,
+        'filter_keywords': False,
         'priority': 'HIGH',
         'description': 'The Morning — general news',
     },
@@ -154,7 +171,7 @@ NEWS_SOURCES = {
         'rss': None,
         'type': 'html',
         'category': 'general',
-        'filter_keywords': True,
+        'filter_keywords': False,
         'priority': 'MEDIUM',
         'description': 'Daily News — state-owned general news',
     },
@@ -163,7 +180,7 @@ NEWS_SOURCES = {
         'rss': None,
         'type': 'html',
         'category': 'general',
-        'filter_keywords': True,
+        'filter_keywords': False,
         'priority': 'HIGH',
         'description': 'Hiru News — general news',
     },
@@ -172,7 +189,7 @@ NEWS_SOURCES = {
         'rss': None,
         'type': 'html',
         'category': 'general',
-        'filter_keywords': True,
+        'filter_keywords': False,
         'priority': 'MEDIUM',
         'description': 'The Island — general news',
     },
@@ -181,7 +198,7 @@ NEWS_SOURCES = {
         'rss': None,
         'type': 'html',
         'category': 'general',
-        'filter_keywords': True,
+        'filter_keywords': False,
         'priority': 'MEDIUM',
         'description': 'Sunday Observer — general news',
     },
@@ -190,16 +207,17 @@ NEWS_SOURCES = {
         'rss': None,
         'type': 'html',
         'category': 'general',
-        'filter_keywords': True,
+        'filter_keywords': False,
         'priority': 'MEDIUM',
         'description': 'Colombo Gazette — general news',
     },
     'ceylon_today': {
+        'max_articles': 12,
         'url': 'https://ceylontoday.lk',
         'rss': None,
         'type': 'html',
         'category': 'general',
-        'filter_keywords': True,
+        'filter_keywords': False,
         'priority': 'MEDIUM',
         'description': 'Ceylon Today — general news',
     },
@@ -208,7 +226,7 @@ NEWS_SOURCES = {
         'rss': None,
         'type': 'html',
         'category': 'general',
-        'filter_keywords': True,
+        'filter_keywords': False,
         'priority': 'MEDIUM',
         'description': 'Sunday Times Sri Lanka — general news',
     },
@@ -219,29 +237,32 @@ NEWS_SOURCES = {
     # Allow: /; the sites' Disallow rules target named AI-training bots
     # specifically, not general crawling — see README for the full check).
     'onlanka': {
+        'max_articles': 12,
         'url': 'https://www.onlanka.com',
         'rss': 'https://www.onlanka.com/feed',
         'type': 'rss',
         'category': 'general',
-        'filter_keywords': True,
+        'filter_keywords': False,
         'priority': 'MEDIUM',
         'description': 'Onlanka — Sri Lanka news and information portal',
     },
     'asianmirror': {
+        'max_articles': 12,
         'url': 'https://asianmirror.lk',
         'rss': 'https://www.asianmirror.lk/feed',
         'type': 'rss',
         'category': 'general',
-        'filter_keywords': True,
+        'filter_keywords': False,
         'priority': 'MEDIUM',
         'description': 'Asian Mirror — politics, international relations and business',
     },
     'lankanewsweb': {
+        'max_articles': 12,
         'url': 'https://lankanewsweb.net',
         'rss': 'https://www.lankanewsweb.net/feed',
         'type': 'rss',
         'category': 'general',
-        'filter_keywords': True,
+        'filter_keywords': False,
         'priority': 'MEDIUM',
         'description': 'Lanka News Web — current affairs and economic analysis',
     },
@@ -262,7 +283,7 @@ NEWS_SOURCES = {
         'rss': None,
         'type': 'html',
         'category': 'general',
-        'filter_keywords': True,
+        'filter_keywords': False,
         'priority': 'MEDIUM',
         'description': 'News.lk — government and policy news',
     },
@@ -275,7 +296,7 @@ NEWS_SOURCES = {
         'rss': None,
         'type': 'json',
         'category': 'general',
-        'filter_keywords': True,
+        'filter_keywords': False,
         'priority': 'MEDIUM',
         'description': 'Helakuru Esana — breaking news aggregator',
     },
@@ -310,7 +331,11 @@ def outlet_name_fragments() -> set:
 # cadence without touching code. 60 is real-time-enough for a news event
 # tracker while giving each run a big-enough window that "found=0" isn't
 # just noise from scraping between publishes (see README).
-SCRAPE_INTERVAL = int(os.environ.get('SCRAPE_INTERVAL', 60))
+# 120 rather than 60. Two reasons, both measured: Sri Lankan outlets do not
+# publish fast enough for an hourly cycle to find much, and every run spends
+# a few Gemini requests on topic maintenance against a 500/day free-tier
+# limit. Halving the cadence halves that fixed cost.
+SCRAPE_INTERVAL = int(os.environ.get('SCRAPE_INTERVAL', 120))
 MAX_ARTICLES_PER_SOURCE = 25
 REQUEST_TIMEOUT = 15        # seconds — 10s was clipping slower sites
                              # (ft.lk observed at 2-3s+ round trip, some
@@ -380,7 +405,16 @@ GEMINI_EMBED_BATCH = int(os.environ.get('GEMINI_EMBED_BATCH', 25))
 GEMINI_EMBED_SLEEP = float(os.environ.get('GEMINI_EMBED_SLEEP', 1.0))
 
 # ── NLP pipeline ──────────────────────────────────────────────────────────
-BODY_BATCH_SIZE = 100
+# 200, raised from 100 when general news stopped being discarded at scrape
+# time. A run started bringing in ~430 new articles instead of ~20, so a
+# 100-article extraction cap turned a one-off catch-up into a permanent
+# backlog. Extraction is network-bound and already runs EXTRACT_MAX_WORKERS
+# in parallel, so doubling it lengthens a run far less than proportionally.
+#
+# Note the ceiling this does NOT lift: embedding quota is charged per
+# ARTICLE (~1,000/day on the free tier), so extracting faster than that just
+# moves the queue from "waiting for body" to "waiting for embedding".
+BODY_BATCH_SIZE = 200
 EMBED_BATCH_SIZE = int(os.environ.get('EMBED_BATCH_SIZE', 256))
 # Articles embedded and committed per sub-batch. Keeps progress durable when a
 # hosted provider rate-limits mid-run: whatever completed is already saved and
@@ -539,10 +573,195 @@ TOPIC_SIMILARITY_THRESHOLD = float(os.environ.get('TOPIC_SIMILARITY_THRESHOLD', 
 # drifted one.
 TOPIC_MATCH_THRESHOLD = float(os.environ.get('TOPIC_MATCH_THRESHOLD', 0.88))
 
+# Give every article HDBSCAN leaves as noise its own single-article cluster,
+# instead of leaving it outside the hierarchy entirely.
+#
+# A story only one outlet carried is still an event — it just has one
+# source. Leaving those articles at cluster_id=-1 meant 41% of the corpus
+# (1,140 of 3,481 articles) could never appear under a topic at all, since
+# topic membership is carried by cluster_labels.topic_id and they had no
+# cluster row to carry it.
+#
+# Chosen over adding articles.topic_id specifically because it needs no
+# schema, API or frontend change: every article still reaches its topic
+# through exactly one cluster, so the article -> cluster -> topic tree stays
+# a tree. The cost is that the cluster count roughly triples, which is why
+# labelling now fetches members in one query rather than one per cluster.
+CLUSTER_PROMOTE_SOLO = os.environ.get(
+    'CLUSTER_PROMOTE_SOLO', 'true').strip().lower() not in ('0', 'false', 'no')
+
+# ── Evicting absorbed outliers ────────────────────────────────────────────
+# OFF. Measured on live data: it removes about as many correct articles as
+# wrong ones, and no threshold separates them:
+#
+#     0.939  "China Jails Evergrande Boss for Life"    SAME story, evicted wrongly
+#     0.934  "PickMe launches Colombo Connect"         different story, correctly out
+#
+# 0.005 apart, opposite correct answers. A margin sweep confirmed it: from
+# 0.05 to 0.15 the wrong removals and the right ones rise and fall together
+# (3/4 and 3/4, then 1/4 and 1/4). There is no setting that keeps one.
+#
+# The cause is that near-duplicate wire copy inside a cluster pushes the
+# median link to ~1.0, lifting the bar high enough to evict a legitimate
+# paraphrase of the same event.
+#
+# Off rather than merely loosened, because the two failure modes cost
+# different amounts. An evicted article becomes its own solo cluster, so a
+# wrong eviction costs the event an OUTLET — directly shrinking the
+# multi-outlet clusters this corpus exists to produce. A wrong keep costs one
+# odd headline in a list. Keeping is the cheaper mistake.
+#
+# The band where arithmetic provably cannot decide (0.86-0.95) holds 41% of
+# clustered articles, so the honest fix is an LLM judge over that band, the
+# same shape as the topic join/merge checks. Deliberately not done: it would
+# put a non-deterministic external call inside EVENT clustering, which today
+# is fully reproducible and works whether or not any API is reachable.
+# BUILT, MEASURED, AND TURNED OFF. An LLM judge over the borderline band was
+# implemented and run against live data. It scored 6/7 on hand-picked cases,
+# but on the corpus it failed the only test that matters:
+#
+#     no eviction        602 clusters with 2+ outlets, 221 with 3+
+#     LLM, evicted 142   588 with 2+, 206 with 3+     <- WORSE than doing nothing
+#
+# Evicting cost 30 multi-outlet events, and the cluster that motivated the
+# whole feature (an SLPP article inside a cluster of NPP rally reports) still
+# contained it afterwards. It also proved sensitive to which sibling
+# headlines it was shown: the same 331 cases produced 0 evictions with peers
+# picked by index order and 142 with peers picked by centrality.
+#
+# Kept as a flag rather than deleted so the experiment can be resumed, but
+# the honest conclusion is that "which article belongs to which event" is not
+# reliably decidable from headlines alone — by arithmetic OR by an LLM — and
+# leaving a wrong article in a cluster is cheaper than removing a right one.
+CLUSTER_EVICT_OUTLIERS = os.environ.get(
+    'CLUSTER_EVICT_OUTLIERS', 'false').strip().lower() in ('1', 'true', 'yes')
+
+# The band where similarity provably cannot decide, so an LLM is asked
+# instead. Outside it the decision is made without a request:
+#     >= HIGH  keep    (near-duplicate wire copy; no doubt)
+#     <  LOW   evict   (cricket in an economics cluster; no doubt)
+# Measured across 1,403 clustered articles: 766 sit above HIGH, 62 below LOW,
+# and 575 — 41% — fall in between. That share is the honest reason this is a
+# judgement call rather than a threshold.
+CLUSTER_EVICT_LLM_LOW = float(os.environ.get('CLUSTER_EVICT_LLM_LOW', 0.86))
+CLUSTER_EVICT_LLM_HIGH = float(os.environ.get('CLUSTER_EVICT_LLM_HIGH', 0.95))
+CLUSTER_EVICT_LLM_BATCH = 40
+
+
+# How far below its cluster's median a member's STRONGEST link to any sibling
+# may fall before it is evicted. Relative, not absolute: measured across 383
+# clusters, the strongest-link distribution runs p5=0.857 to p50=0.949, so a
+# fixed cut either spares real outliers in tight clusters or guts loose ones.
+#
+# 0.05 evicts 11% of members in clusters of 3+, and on the cluster that
+# prompted this it removed exactly the two wrong articles (0.869 and 0.907)
+# while keeping all four correct ones (0.949-0.975).
+CLUSTER_OUTLIER_MARGIN = float(os.environ.get('CLUSTER_OUTLIER_MARGIN', 0.05))
+
+# Absolute backstop, so a cluster whose members are ALL weakly linked (a
+# grab-bag rather than an event) still sheds them. One real example held a
+# javelin throw, a 400m race and the London Marathon.
+CLUSTER_OUTLIER_FLOOR = float(os.environ.get('CLUSTER_OUTLIER_FLOOR', 0.86))
+
+# ── Joining a topic vs forming one ────────────────────────────────────────
+# Forming a topic and joining an existing one are different problems and get
+# different rules. Forming compares two centroids with no anchor between
+# them, so it must be strict. Joining compares one cluster against a topic
+# centroid already averaged over several events — a much better-defined
+# target — so it can admit clusters complete linkage excluded for failing
+# against a single member.
+#
+# MEASURED, and the first attempt at this was wrong: a *looser cosine* alone
+# does not work at all under Gemini embeddings. Unrelated Sri Lankan business
+# news sits around 0.92, so the whole leftover distribution is compressed
+# into 0.83-0.92 (p50=0.890) and no cut separates good from bad. At 0.925 it
+# accepted "CSE & Sampath Bank MoU" -> "People's Leasing partners Toyota"
+# while rejecting "SLT-MOBITEL entertainment" -> "SLT-MOBITEL partners vivo"
+# at 0.920. Cosine there is measuring domain and register, not subject.
+#
+# The fix is a second, independent signal that is not another similarity
+# number. Cosine survives only as a cheap pre-filter that bounds how many
+# candidates reach the expensive check; the actual decision is Gemini's.
+
+# Cosine to a topic centroid below which a leftover cluster is not considered
+# at all. Held at TOPIC_SIMILARITY_THRESHOLD deliberately: matching a
+# centroid at 0.90 is already looser than complete linkage's "0.90 against
+# every member", so this widens the rule without lowering the bar.
+TOPIC_JOIN_SIMILARITY = float(os.environ.get('TOPIC_JOIN_SIMILARITY', 0.90))
+
+# Strongest shared term between the candidate's headline and any member's,
+# scored by IDF over all cluster headlines. REMOVED — measured and it does
+# not work. Rarity is not specificity: across 858 cluster headlines
+# "branch" (df=4) scores 0.849 while "treasury" (df=13) scores 0.679, so
+# every cut that drops "branch", "strategic" and "2025" drops "treasury"
+# and "iran" first. Good and bad shared terms overlap completely. Kept as a
+# comment because it is a genuinely tempting idea that has to be measured
+# to be rejected.
+#
+# Gemini decides instead. The project already calls it to *name* topics, so
+# asking it to check membership adds no new dependency, and it is the one
+# component that can tell "another bank's press release" from "the same
+# story". Batched, so ~90 candidates cost 4-5 calls per run rather than 90.
+# Failure is closed: if the API is unavailable, nothing joins and coverage
+# falls back to the strict core rather than admitting unverified members.
+TOPIC_JOIN_LLM_BATCH = 40
+
+# Hard cap on join candidates per run, so the request cost of this stage is
+# bounded no matter how large the corpus gets. Clusters touched by THIS run
+# are considered first — a cluster that has just changed is the one whose
+# topic is most likely wrong — and the rest are ordered by similarity.
+# Anything not reached is reconsidered next run, so coverage converges over
+# a few cycles instead of re-asking the same settled questions every time.
+#
+# The budget this protects: the free tier allows 500 requests/day. At a
+# 2-hour cadence that is 12 runs, so a run can afford roughly 40 requests.
+# Before this cap the join stage alone wanted 18 of them every single run,
+# most spent re-confirming clusters that had not changed.
+TOPIC_JOIN_MAX_CANDIDATES = 80
+
+# Only the few nearest topics are worth testing; beyond that the cosine gate
+# rejects everything anyway.
+TOPIC_JOIN_CANDIDATES = 3
+
 # How many event clusters must group together before it's presented as a
 # topic at all. Below this, a cluster keeps topic_id=NULL — a standalone
 # event, not forced into a topic it doesn't belong to.
 TOPIC_MIN_CLUSTERS = 2
+
+# ── Merging over-split topics ─────────────────────────────────────────────
+# Complete linkage at TOPIC_SIMILARITY_THRESHOLD is strict on purpose, and
+# strictness splits one story into two topics. Measured after the first full
+# run with LLM-validated joins:
+#     11 events  "Judicial Retirement Amendment Controversy"
+#      6 events  "Judicial Retirement Age Debate"
+#     25 events  "Sri Lanka Economic Recovery"
+#      6 events  "Sri Lanka Economic Outlook"
+# Each pair is one story. Lowering the formation threshold to fix this is
+# the move already measured and rejected — at 0.83 it merged 168 unrelated
+# events into a single topic. So formation stays strict, and topic pairs
+# just below it are put to the same judge that validates joins.
+
+# Cosine between topic centroids below which a pair is not even considered
+# for merging. HIGH, and measured: topic centroids are averages of averages,
+# so they sit even closer together than cluster centroids do. Across 158
+# topics, 4,280 pairs clear 0.85 and 691 still clear 0.90 — a low floor here
+# does not narrow anything, it just fills the budget below with noise. Real
+# duplicates measured 0.956-0.971 ("Sri Lanka Prison Unrest" / "Sri Lanka
+# Prison Crisis", and two topics both titled "Business Today Rankings").
+TOPIC_MERGE_FLOOR = float(os.environ.get('TOPIC_MERGE_FLOOR', 0.94))
+
+# Hard cap on how many pairs reach the LLM in one run, highest similarity
+# first. Bounds cost and run time; anything not reached this run is
+# reconsidered next run, so merging converges over a few cycles rather than
+# trying to fix everything at once.
+TOPIC_MERGE_MAX_PAIRS = 40
+
+# A merge is refused if it would take a topic past this many events. Merging
+# is transitive through union-find, so an unguarded chain of individually
+# reasonable merges (A~B, B~C, C~D) can collapse into one oversized topic
+# where the ends have nothing to do with each other — the same chaining
+# failure that ruled out average linkage at the formation stage.
+TOPIC_MERGE_MAX_SIZE = 30
 
 # ── Cluster labeling ──────────────────────────────────────────────────────
 # Layered fallback for picking each cluster's headline, adapted from the
@@ -557,7 +776,37 @@ TOPIC_MIN_CLUSTERS = 2
 # best pick still looks weak (see CLUSTER_LABEL_QUALITY_FLOOR) — it isn't
 # used on every cluster, just the ones the heuristic can't label well.
 CLUSTER_LABEL_USE_LLM = os.environ.get('CLUSTER_LABEL_USE_LLM', '').strip().lower() in ('1', 'true', 'yes')
-GEMINI_LABEL_MODELS = ['gemini-flash-latest', 'gemini-2.5-flash', 'gemini-3.1-flash-lite']
+
+# Topic labels are a separate decision from event labels, and default ON.
+#
+# An event label can be a real headline lifted from a member article — that
+# reads correctly. A *topic* spans several different events, so naming it
+# after one of them is actively misleading: a 10-event topic covering SME
+# support, board governance, a trade delegation and an investment summit was
+# titled "Intex - InMac Sri Lanka 2026 opens at BMICH".
+#
+# The extractive tiers cannot fix this. KeyBERT needs the local model (gone
+# under the Gemini provider), and a shared-phrase heuristic only works when
+# the members happen to share wording — measured across real topics it beat
+# the current label about half the time and was worse the other half.
+# The LLM produces proper topic names ("Sri Lanka Prison Crisis",
+# "Awards and Recognition") and is cheap here because only topics whose
+# membership actually changed get relabelled — a handful per run, not all 48.
+TOPIC_LABEL_USE_LLM = os.environ.get('TOPIC_LABEL_USE_LLM', 'true').strip().lower() not in ('0', 'false', 'no')
+# How many topics are named in a single request. Free-tier quota is counted
+# per REQUEST, not per topic, so this is the difference between a run that
+# fits in the daily budget and one that does not.
+TOPIC_LABEL_BATCH = 15
+
+# Ordered by free-tier daily request quota, highest first — MEASURED against
+# the live API, because the order matters far more than it looks:
+#     gemini-3.1-flash-lite   500 requests/day
+#     gemini-flash-latest      20 requests/day
+# The previous order tried the 20/day model first and exhausted it almost
+# immediately, after which every later stage in the run fell back to its
+# fail-closed path. `gemini-2.5-flash` was also in this list and now returns
+# 404, wasting a round trip on every single call.
+GEMINI_LABEL_MODELS = ['gemini-3.1-flash-lite', 'gemini-flash-latest']
 
 # Below this _title_quality score (0-1), the heuristic's best real headline
 # is considered too weak to use as-is — too short, opinion-toned, no

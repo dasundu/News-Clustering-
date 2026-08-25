@@ -16,7 +16,8 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Optional
 
-from config import NEWS_SOURCES, REQUEST_TIMEOUT, USER_AGENT, classify_category, SCRAPE_MAX_WORKERS
+from config import (NEWS_SOURCES, REQUEST_TIMEOUT, USER_AGENT, classify_category,
+                    SCRAPE_MAX_WORKERS, SOURCE_ARTICLE_CAP)
 from database import ArticleDatabase
 
 logger = logging.getLogger(__name__)
@@ -182,9 +183,23 @@ class NewsScraper:
             'lankabusinessnews': self._scrape_lankabusinessnews,
         }
         fn = scraper_map.get(source_name)
-        if fn:
-            return fn(source_name, config)
-        return self._scrape_html_generic(source_name, config)
+        articles = (fn(source_name, config) if fn
+                    else self._scrape_html_generic(source_name, config))
+
+        # Per-source intake cap, applied in ONE place rather than in each of
+        # the ~20 scrapers. Measured need: four sources (ceylon_today,
+        # lankanewsweb, onlanka, asianmirror) produced 76% of a day's 1,293
+        # articles while having the LOWEST share of articles landing in a
+        # multi-outlet cluster (6-29%). They cost storage and embedding quota
+        # at the same rate as everything else and contribute least to the
+        # cross-outlet comparison the corpus exists for. Capping is preferred
+        # over dropping them: the outlet stays in the mix, it just stops
+        # dominating the intake.
+        cap = config.get('max_articles', SOURCE_ARTICLE_CAP)
+        if cap and len(articles) > cap:
+            logger.debug(f"  {source_name}: capped {len(articles)} -> {cap}")
+            articles = articles[:cap]
+        return articles
 
     # ── Shared discovery helpers ───────────────────────────────────────────
 

@@ -77,14 +77,30 @@ _local_lock = threading.Lock()
 
 
 def _get_local_model():
-    """Loaded once per process, not once per call. Lock-guarded because
-    uvicorn serves from a thread pool, so two concurrent first-requests could
-    otherwise both start a ~458MB model load."""
+    """
+    Loaded once per process, not once per call. Lock-guarded because uvicorn
+    serves from a thread pool, so two concurrent first-requests could
+    otherwise both start a ~458MB model load.
+
+    The dependencies are NOT installed by default — the project ships
+    Gemini-only. This path exists for offline work and for deterministic
+    evaluation runs, and needs an explicit opt-in install.
+    """
     global _local_model
     if _local_model is None:
         with _local_lock:
             if _local_model is None:
-                from sentence_transformers import SentenceTransformer
+                try:
+                    from sentence_transformers import SentenceTransformer
+                except ImportError as e:
+                    raise RuntimeError(
+                        "EMBEDDING_PROVIDER=local needs sentence-transformers, which is "
+                        "not installed (this project runs on the Gemini API by default). "
+                        "Install it with:  pip install sentence-transformers keybert . "
+                        "Note that switching provider re-embeds the whole corpus and "
+                        "invalidates every similarity threshold in config.py — run "
+                        "compare_embeddings.py afterwards."
+                    ) from e
                 logger.info(f"Loading local embedding model: {LOCAL_EMBEDDING_MODEL}")
                 _local_model = SentenceTransformer(LOCAL_EMBEDDING_MODEL)
     return _local_model

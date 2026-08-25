@@ -6,6 +6,7 @@ Visits each article URL and extracts clean text — no site-specific selectors n
 
 import hashlib
 import logging
+import re
 import threading
 import trafilatura
 from urllib.parse import urlparse
@@ -18,6 +19,36 @@ from config import BODY_BATCH_SIZE, EXTRACT_MAX_WORKERS, REQUEST_TIMEOUT
 logger = logging.getLogger(__name__)
 
 _MIN_BODY_LEN = 80
+
+# How much of a body identifies it for duplicate detection. Whole-body hashes
+# miss near-duplicates: the same wrongly-extracted block can come back with a
+# trailing sentence trimmed and hash differently, which is exactly how wrong
+# content used to slip through. The opening is the identifying part.
+_FINGERPRINT_CHARS = 300
+
+# A rescued body must share at least this fraction of its title's meaningful
+# words. Duplicate detection alone cannot catch a wrongly-extracted block that
+# happens to be unique within one batch — measured on economynext, an article
+# titled "Singer Finance plans rights issue" was handed a body about
+# diplomatic missions and passed every structural check. Title overlap
+# separates them cleanly: correct extractions scored 0.62-1.00, that one 0.00.
+_MIN_TITLE_OVERLAP = 0.20
+_OVERLAP_STOPWORDS = frozenset(
+    'the a an of in on at to for and or is was were be been by with from as '
+    'its it this that has have had will would say says said sri lanka'.split()
+)
+
+
+def _title_overlap(title: str, body: str) -> float:
+    """Fraction of the title's distinctive words that appear near the start of
+    the body. A news article almost always restates its headline early on."""
+    def _words(text):
+        return {w for w in re.findall(r"[a-z0-9]+", text.lower())
+                if w not in _OVERLAP_STOPWORDS and len(w) > 2}
+    title_words = _words(title)
+    if not title_words:
+        return 1.0          # nothing to check against; don't reject on this
+    return len(title_words & _words(body[:600])) / len(title_words)
 
 # Caps concurrent requests to any single host, independent of
 # EXTRACT_MAX_WORKERS. A batch of 100 articles routinely has 30+ from one
@@ -72,24 +103,72 @@ class BodyExtractor:
                 futures = {pool.submit(self._fetch, a['url']): a for a in articles}
                 for future in as_completed(futures):
                     article = futures[future]
-                    body, image_url = future.result()
-                    results.append((article, body, image_url))
+                    body, alt_body, image_url = future.result()
+                    results.append((article, body, alt_body, image_url))
 
             # Detect sidebar/widget content: same body >= 2 times from same source
-            source_hash_counts: dict = {}
-            for article, body, _ in results:
-                if body and len(body) >= _MIN_BODY_LEN:
-                    h = hashlib.md5(body.encode()).hexdigest()
-                    src = article['source']
-                    source_hash_counts.setdefault(src, {})
-                    source_hash_counts[src][h] = source_hash_counts[src].get(h, 0) + 1
+            def _fingerprint(text):
+                """
+                Hash a normalised PREFIX, not the whole body.
+
+                Two extractions of the same wrong block often differ by a
+                trailing sentence or some whitespace, which is enough to make
+                whole-body hashes disagree — observed on economynext, where
+                the same featured article came out as 2076 and 2047 chars and
+                slipped past exact matching. The opening of an article is
+                what actually identifies it.
+                """
+                return hashlib.md5(
+                    ' '.join(text[:_FINGERPRINT_CHARS].split()).lower().encode()
+                ).hexdigest()
+
+            def _counts(idx):
+                counts: dict = {}
+                for row in results:
+                    text = row[idx]
+                    if text and len(text) >= _MIN_BODY_LEN:
+                        h = _fingerprint(text)
+                        counts.setdefault(row[0]['source'], {})
+                        counts[row[0]['source']][h] = counts[row[0]['source']].get(h, 0) + 1
+                return counts
+
+            body_counts = _counts(1)   # favor_recall results
+            alt_counts = _counts(2)    # favor_precision results
 
             updated = 0
+            rescued = 0
             discarded = 0
-            for article, body, image_url in results:
-                if body and len(body) >= _MIN_BODY_LEN:
-                    h = hashlib.md5(body.encode()).hexdigest()
-                    if source_hash_counts.get(article['source'], {}).get(h, 0) >= 2:
+            for article, body, alt_body, image_url in results:
+                src = article['source']
+
+                def _is_dup(text, counts):
+                    if not text or len(text) < _MIN_BODY_LEN:
+                        return False
+                    return counts.get(src, {}).get(_fingerprint(text), 0) >= 2
+
+                if _is_dup(body, body_counts):
+                    # The default extraction latched onto the same block for
+                    # several articles from this source — it is boilerplate or
+                    # the wrong article, not this one's body. Before throwing
+                    # it away, try the stricter extraction: on sites where
+                    # recall grabs a featured/sidebar block, precision usually
+                    # picks the real one, and it is per-article rather than
+                    # repeated.
+                    rescuable = (
+                        alt_body
+                        and len(alt_body) >= _MIN_BODY_LEN
+                        and not _is_dup(alt_body, alt_counts)
+                        # Structural checks can't tell "wrong article" from
+                        # "this article" when the wrong block appears only
+                        # once in the batch. Require the body to actually be
+                        # about the headline.
+                        and _title_overlap(article.get('title', ''), alt_body) >= _MIN_TITLE_OVERLAP
+                    )
+                    if rescuable:
+                        logger.debug(f"  Rescued with favor_precision: {article['url']}")
+                        body = alt_body
+                        rescued += 1
+                    else:
                         logger.debug(f"  Discarded duplicate sidebar body: {article['url']}")
                         body = ''
                         discarded += 1
@@ -98,6 +177,8 @@ class BodyExtractor:
                 if body:
                     updated += 1
 
+            if rescued:
+                logger.info(f"  Rescued {rescued} bodies via favor_precision fallback")
             if discarded:
                 logger.warning(f"  Discarded {discarded} duplicate bodies (sidebar/widget content)")
             logger.info(f"Body extraction done: {updated}/{len(articles)} successful")
@@ -105,14 +186,32 @@ class BodyExtractor:
         return len(articles)
 
     def _fetch(self, url: str):
-        """Returns (body_text, image_url). Both may be empty strings."""
+        """
+        Returns (body_text, alt_body_text, image_url).
+
+        Two extractions from the SAME html — no extra request:
+
+          body      favor_recall, the default. Gets the most text and works
+                    on the widest range of layouts.
+          alt_body  favor_precision, a stricter fallback. Only used when the
+                    recall result turns out to be duplicated across articles
+                    from one source (see run()).
+
+        Why both: on some sites recall latches onto the wrong block — a
+        featured or sidebar article — and returns the *same* text for every
+        page. Measured on economynext, that accounted for 417 empty bodies:
+        extraction wasn't failing, it was confidently returning the wrong
+        article, which duplicate detection then correctly threw away.
+        Precision picks the right block there. It is not the default because
+        it regresses other sites badly (business_today: 16k chars -> 260).
+        """
         try:
             with _host_semaphore(url):
                 r = self.session.get(url, timeout=REQUEST_TIMEOUT)
                 r.raise_for_status()
                 html = r.text
             if not html:
-                return '', ''
+                return '', '', ''
 
             text = trafilatura.extract(
                 html,
@@ -120,12 +219,18 @@ class BodyExtractor:
                 include_comments=False,
                 include_tables=False,
             ) or ''
+            alt = trafilatura.extract(
+                html,
+                favor_precision=True,
+                include_comments=False,
+                include_tables=False,
+            ) or ''
 
             image_url = _extract_og_image(html)
-            return text, image_url
+            return text, alt, image_url
         except Exception as e:
             logger.warning(f"Body fetch failed for {url}: {e}")
-            return '', ''
+            return '', '', ''
 
 
 _IMG_PATH_HINTS = ('/uploads/', '/images/', '/media/', '/wp-content/', '/photo', '/news/', '/files/')
