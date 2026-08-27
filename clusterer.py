@@ -497,6 +497,44 @@ def _cosine(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / denom)
 
 
+# ── embedding cache ───────────────────────────────────────────────────────
+# The scheduler is one long-lived process, so vectors fetched on one run are
+# still in memory on the next. Only genuinely new articles are downloaded.
+#
+# Why this exists: measured against the live database, a clustering run
+# pulled 32 MB of embeddings across three queries — the 14-day window, every
+# cluster's members for the topic pass, and every cluster's members again for
+# labelling. At hourly runs that is 22.7 GB/month against a 5 GB network
+# allowance, and almost none of it changes between runs.
+#
+# Bounded by construction: one entry per article that has ever been in a
+# clustering window, at 3 KB each. The whole corpus is ~12 MB, and articles
+# are only ever added, never mutated — an embedding is rewritten only when
+# the provider changes, which also changes model_id and invalidates the
+# cache wholesale.
+_EMB_CACHE: dict = {}
+_EMB_CACHE_MODEL: str = ''
+
+
+def _cached_embeddings(db, article_ids: list, model_id: str) -> dict:
+    """{article_id: np.ndarray} for the ids given, fetching only misses."""
+    global _EMB_CACHE, _EMB_CACHE_MODEL
+    if _EMB_CACHE_MODEL != model_id:
+        # A provider change puts every stored vector in a different space,
+        # so nothing cached under the old model is comparable.
+        _EMB_CACHE = {}
+        _EMB_CACHE_MODEL = model_id
+
+    missing = [i for i in article_ids if i not in _EMB_CACHE]
+    if missing:
+        raw = db.get_embeddings_by_ids(missing)
+        for aid, blob in raw.items():
+            _EMB_CACHE[aid] = np.frombuffer(blob, dtype='float32')
+        logger.info(f"Embedding cache: {len(article_ids) - len(missing)} hits, "
+                    f"{len(raw)} fetched")
+    return {i: _EMB_CACHE[i] for i in article_ids if i in _EMB_CACHE}
+
+
 def _unit_rows(m: np.ndarray) -> np.ndarray:
     """Row-wise L2 normalize, so a matmul yields cosine similarity."""
     return m / (np.linalg.norm(m, axis=1, keepdims=True) + 1e-9)
@@ -999,21 +1037,28 @@ class ArticleClusterer:
 
     def run(self) -> dict:
         model_id = embedding_provider.model_id()
-        rows = self.db.get_recent_embeddings(CLUSTER_WINDOW_DAYS, model_id)
+        rows = self.db.get_recent_embedding_meta(CLUSTER_WINDOW_DAYS, model_id)
         if len(rows) < 4:
             logger.info(f"Too few embedded articles in the last "
                         f"{CLUSTER_WINDOW_DAYS}d ({len(rows)}) to cluster")
             return {'total': len(rows), 'clusters': 0, 'noise': len(rows),
                     'new_clusters': 0, 'continued_clusters': 0}
 
+        # Vectors come from the in-process cache; only ids it has never seen
+        # are fetched. Anything still missing (a row deleted between the two
+        # queries) is dropped rather than crashing the run.
+        vectors = _cached_embeddings(self.db, [r['id'] for r in rows], model_id)
+        rows = [r for r in rows if r['id'] in vectors]
+        if len(rows) < 4:
+            logger.info("Too few embeddings available to cluster")
+            return {'total': len(rows), 'clusters': 0, 'noise': len(rows),
+                    'new_clusters': 0, 'continued_clusters': 0}
         ids = [r['id'] for r in rows]
         prev_ids = [r['cluster_id'] for r in rows]
         sources = [r['source'] for r in rows]
         titles = [r.get('title') or '' for r in rows]
         dates = [r['effective_date'] for r in rows]
-        matrix = np.stack([
-            np.frombuffer(r['embedding'], dtype='float32') for r in rows
-        ])
+        matrix = np.stack([vectors[i] for i in ids])
 
         epsilon = _adaptive_epsilon(matrix)
         logger.info(f"Clustering {len(ids)} articles from the last "
@@ -1028,6 +1073,20 @@ class ArticleClusterer:
         labels = model.fit_predict(matrix)
         labels = _refine_clusters(labels, matrix, sources, dates,
                                   titles, ids, self.db)
+
+        # Human overrides, applied after refinement so they cannot be undone
+        # by a later merge. An excluded article falls to noise and, with
+        # CLUSTER_PROMOTE_SOLO, becomes its own single-article cluster — it
+        # is removed from a group it does not belong to, not from the corpus.
+        excluded = self.db.get_excluded_article_ids()
+        if excluded:
+            hits = 0
+            for i, aid in enumerate(ids):
+                if aid in excluded and labels[i] != -1:
+                    labels[i] = -1
+                    hits += 1
+            if hits:
+                logger.info(f"Applied {hits} manual cluster exclusions")
 
         solo_count = 0
         if CLUSTER_PROMOTE_SOLO:
@@ -1137,15 +1196,15 @@ class ArticleClusterer:
         centroids: dict = {}
         labels_by_cluster: dict = {}
         try:
-            bulk = self.db.get_cluster_members_bulk(
-                cluster_ids, embedding_provider.model_id())
+            model_id = embedding_provider.model_id()
+            bulk = self.db.get_cluster_member_titles(cluster_ids, model_id)
+            all_ids = [m['id'] for ms in bulk.values() for m in ms]
+            vectors = _cached_embeddings(self.db, all_ids, model_id)
             for cid in cluster_ids:
-                members = bulk.get(cid)
+                members = [m for m in bulk.get(cid, []) if m['id'] in vectors]
                 if not members:
                     continue
-                vecs = np.stack([
-                    np.frombuffer(m['embedding'], dtype='float32') for m in members
-                ])
+                vecs = np.stack([vectors[m['id']] for m in members])
                 titles = [m['title'] for m in members]
 
                 centroid = vecs.mean(axis=0)
@@ -1383,14 +1442,16 @@ class ClusterTopicBuilder:
         """Full-membership centroid for every cluster in the corpus.
         One query plus numpy grouping — a few hundred centroids over a few
         thousand vectors, so cheap relative to the clustering itself."""
-        rows = self.db.get_all_cluster_embeddings(embedding_provider.model_id())
-        buckets: dict = {}
-        for r in rows:
-            cid = r['cluster_id']
-            buckets.setdefault(cid, []).append(
-                np.frombuffer(r['embedding'], dtype='float32'))
+        model_id = embedding_provider.model_id()
+        membership = self.db.get_cluster_membership(model_id)
+        wanted = [aid for ids in membership.values() for aid in ids]
+        vectors = _cached_embeddings(self.db, wanted, model_id)
+
         out = {}
-        for cid, vecs in buckets.items():
+        for cid, aids in membership.items():
+            vecs = [vectors[a] for a in aids if a in vectors]
+            if not vecs:
+                continue
             c = np.stack(vecs).mean(axis=0)
             out[cid] = c / (np.linalg.norm(c) + 1e-9)
         return out

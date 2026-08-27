@@ -158,6 +158,16 @@ class ArticleDatabase:
             # was embedded, so a body update (re-cleaning, a source
             # correction) can also be detected as making the stored vector
             # stale, independent of any model change.
+            # Human override for a clustering mistake. Automated removal of
+            # wrongly-grouped articles was built, measured and rejected: the
+            # wrong article routinely scores HIGHER than a correct one (a
+            # Muay Thai report sat at 0.963 inside a javelin cluster whose
+            # genuine members scored 0.925), and an LLM judge over the
+            # undecidable band made the multi-outlet cluster count worse than
+            # doing nothing. What remains is targeted human correction — rare,
+            # deliberate, and reversible.
+            cur.execute('ALTER TABLE articles ADD COLUMN IF NOT EXISTS '
+                        'cluster_excluded BOOLEAN DEFAULT FALSE')
             cur.execute('ALTER TABLE articles ADD COLUMN IF NOT EXISTS embedding_model TEXT')
             cur.execute('ALTER TABLE articles ADD COLUMN IF NOT EXISTS embedding_source_hash TEXT')
             cur.execute('''
@@ -972,6 +982,27 @@ class ArticleDatabase:
             for r in rows
         ]
 
+    def set_cluster_excluded(self, article_id: int, excluded: bool = True) -> bool:
+        """Mark an article as not belonging to whatever cluster it lands in.
+        It keeps its row and its url record; clustering simply refuses to
+        group it, so it becomes a single-article cluster of its own."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute('UPDATE articles SET cluster_excluded=%s WHERE id=%s',
+                        (excluded, article_id))
+            ok = cur.rowcount > 0
+        conn.commit()
+        self._release(conn)
+        return ok
+
+    def get_excluded_article_ids(self) -> set:
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute('SELECT id FROM articles WHERE cluster_excluded IS TRUE')
+            ids = {r[0] for r in cur.fetchall()}
+        self._release(conn)
+        return ids
+
     def get_max_article_id(self) -> int:
         """Highest article id in the table — the watermark a consumer passes
         back as `since_id` to fetch only what has changed since."""
@@ -989,6 +1020,65 @@ class ArticleDatabase:
             (max_id,) = cur.fetchone()
         self._release(conn)
         return max_id
+
+    def get_recent_embedding_meta(self, days: int, embedding_model: str = None) -> List[Dict]:
+        """Everything get_recent_embeddings returns EXCEPT the vectors.
+
+        Splitting the vectors out is what makes an embedding cache possible.
+        Metadata for a 14-day window is a couple of hundred kilobytes; the
+        vectors are ~8 MB, and re-downloading them every hour was the single
+        largest consumer of the database's network allowance (measured: 32 MB
+        per run across three queries, 22.7 GB/month against a 5 GB limit).
+        """
+        conn = self._connect()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id, title, cluster_id, source,
+                       COALESCE(published_at, scraped_at) AS effective_date
+                FROM articles
+                WHERE embedding IS NOT NULL
+                  AND body IS NOT NULL AND body <> ''
+                  AND (%s IS NULL OR embedding_model = %s)
+                  AND COALESCE(published_at, scraped_at) >= NOW() - (%s || ' days')::interval
+            """, (embedding_model, embedding_model, days))
+            rows = cur.fetchall()
+        self._release(conn)
+        return [dict(r) for r in rows]
+
+    def get_embeddings_by_ids(self, article_ids: List[int]) -> Dict[int, bytes]:
+        """Vectors for specific articles — the cache-miss path."""
+        if not article_ids:
+            return {}
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute('SELECT id, embedding FROM articles '
+                        'WHERE id = ANY(%s) AND embedding IS NOT NULL',
+                        (list(article_ids),))
+            rows = cur.fetchall()
+        self._release(conn)
+        return {r[0]: bytes(r[1]) for r in rows}
+
+    def get_cluster_membership(self, embedding_model: str) -> Dict[int, List[int]]:
+        """{cluster_id: [article_id]} for every clustered article, no vectors.
+
+        Lets the topic pass rebuild centroids from cached vectors instead of
+        pulling 12 MB of embeddings out of the database on every run.
+        """
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT cluster_id, id FROM articles
+                WHERE cluster_id IS NOT NULL AND cluster_id >= 0
+                  AND embedding IS NOT NULL
+                  AND body IS NOT NULL AND body <> ''
+                  AND embedding_model = %s
+            """, (embedding_model,))
+            rows = cur.fetchall()
+        self._release(conn)
+        out: Dict[int, List[int]] = {}
+        for cid, aid in rows:
+            out.setdefault(cid, []).append(aid)
+        return out
 
     def get_all_cluster_embeddings(self, embedding_model: str) -> List[Dict]:
         """
@@ -1048,11 +1138,19 @@ class ArticleDatabase:
                            ROW_NUMBER() OVER (
                                PARTITION BY a.cluster_id
                                ORDER BY a.published_at DESC NULLS LAST, a.id DESC
-                           ) AS rn
+                           ) AS rn,
+                           -- Second numbering, over (outlet, headline), so a
+                           -- republished story is shown once. See
+                           -- get_cluster_articles for why URL dedup misses it.
+                           ROW_NUMBER() OVER (
+                               PARTITION BY a.cluster_id, a.source,
+                                            LOWER(TRIM(a.title))
+                               ORDER BY a.published_at DESC NULLS LAST, a.id DESC
+                           ) AS dup_rn
                     FROM articles a
                     WHERE a.cluster_id = ANY(%s)
                       AND a.body IS NOT NULL AND a.body <> ''
-                ) t WHERE rn <= %s
+                ) t WHERE dup_rn = 1 AND rn <= %s
             """, (list(cluster_ids), per_cluster))
             rows = cur.fetchall()
         self._release(conn)
@@ -1063,6 +1161,32 @@ class ArticleDatabase:
                 'url': r['url'], 'published_at': r['published_at'],
                 'image_url': r['image_url'], 'body': r['body'],
             })
+        return out
+
+    def get_cluster_member_titles(self, cluster_ids: List[int],
+                                  embedding_model: str = None) -> Dict[int, List[Dict]]:
+        """get_cluster_members_bulk without the vectors.
+
+        Labelling needs the titles and the ids; the vectors it also used come
+        from the in-process cache instead. That removes the third full
+        embedding download per run — the largest of the three at ~12 MB.
+        """
+        if not cluster_ids:
+            return {}
+        conn = self._connect()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT cluster_id, id, title FROM articles "
+                "WHERE cluster_id = ANY(%s) AND embedding IS NOT NULL "
+                "AND (%s IS NULL OR embedding_model = %s)",
+                (list(cluster_ids), embedding_model, embedding_model)
+            )
+            rows = cur.fetchall()
+        self._release(conn)
+        out: Dict[int, List[Dict]] = {}
+        for r in rows:
+            out.setdefault(r['cluster_id'], []).append(
+                {'id': r['id'], 'title': r['title']})
         return out
 
     def get_cluster_members_bulk(self, cluster_ids: List[int],
@@ -1224,13 +1348,37 @@ class ArticleDatabase:
         return result
 
     def get_cluster_articles(self, cluster_id: int) -> List[Dict]:
+        """
+        One row per (outlet, headline), newest kept.
+
+        Outlets republish: Ada Derana carried "Advisory issued for strong
+        winds and rough seas" on two consecutive days under different URLs,
+        so URL-level dedup — which is airtight — cannot see it. Without this
+        the same headline appeared twice in a cluster while article_count,
+        which has always counted DISTINCT (source, title), said otherwise.
+
+        body_cleaned first: `body` is the raw extraction and still carries
+        markup from some sources, which rendered as a literal "<p>" in the
+        UI.
+        """
         conn = self._connect()
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                "SELECT id, title, body, source, published_at, url, cluster_id, category, image_url "
-                "FROM articles WHERE cluster_id=%s ORDER BY published_at DESC",
-                (cluster_id,)
-            )
+            cur.execute("""
+                SELECT id, title, body, source, published_at, url, cluster_id,
+                       category, image_url
+                FROM (
+                    SELECT id, title,
+                           COALESCE(body_cleaned, body) AS body,
+                           source, published_at, url, cluster_id, category,
+                           image_url,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY source, LOWER(TRIM(title))
+                               ORDER BY published_at DESC NULLS LAST, id DESC
+                           ) AS rn
+                    FROM articles WHERE cluster_id=%s
+                ) t WHERE rn = 1
+                ORDER BY published_at DESC NULLS LAST
+            """, (cluster_id,))
             rows = cur.fetchall()
         self._release(conn)
         result = []

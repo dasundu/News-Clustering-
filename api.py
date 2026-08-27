@@ -513,6 +513,47 @@ class ClusterFeed(BaseModel):
 # declaration order, and that one types its parameter as int, so a literal
 # path segment declared after it would fail validation rather than fall
 # through.
+@app.get("/category/{category}", response_model=ClusterFeed)
+def by_category(category: str):
+    """
+    Every event in one category, with every article inside it.
+
+    Deliberately parameterless. /clusters can express far more — outlet
+    counts, sort order, paging, preview length — but a consumer that just
+    wants "all the politics coverage" should not have to know that
+    include_articles defaults to false, or pick an articles_per_cluster.
+    Getting either wrong returns a technically-valid response with the
+    articles silently missing, which is a bad failure to hand someone.
+
+    So: pass a category, get everything. Full article text, no caps, no
+    minimum outlet count — single-outlet stories are included, because
+    "all" should mean all.
+
+    Use /clusters instead when you want to filter or page.
+    """
+    valid = {'politics', 'economics', 'general', 'all'}
+    if category not in valid:
+        raise HTTPException(
+            status_code=400,
+            detail=f"category must be one of {sorted(valid)}")
+
+    clusters = db.get_clusters(
+        min_size=1,
+        min_sources=1,
+        category=None if category == 'all' else category,
+        sort='latest',
+    )
+    by_cluster = db.get_articles_for_clusters(
+        [c['cluster_id'] for c in clusters], per_cluster=200, full_body=True)
+    for c in clusters:
+        c['articles'] = by_cluster.get(c['cluster_id'], [])
+    return {
+        'next_id': db.get_max_article_id(),
+        'count': len(clusters),
+        'clusters': clusters,
+    }
+
+
 @app.get("/feed", response_model=ClusterFeed)
 def feed(since_id: int = Query(0, ge=0, description="Pass 0 the first time, "
                                                     "then the next_id you got back.")):
