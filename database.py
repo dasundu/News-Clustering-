@@ -1256,7 +1256,8 @@ class ArticleDatabase:
 
     def get_clusters(self, min_size: int = 2, category: str = None,
                      topic_id: int = None, sort: str = 'latest',
-                     min_sources: int = 1, since_id: int = 0) -> List[Dict]:
+                     min_sources: int = 1, since_id: int = 0,
+                     limit: int = None, offset: int = 0) -> List[Dict]:
         """min_size counts distinct ARTICLES, min_sources counts distinct
         OUTLETS. They are not interchangeable: one outlet publishing three
         related pieces satisfies min_size=2 while showing a single outlet
@@ -1264,15 +1265,22 @@ class ArticleDatabase:
         several papers covered."""
         conn = self._connect()
         order_by = self._CLUSTER_SORTS.get(sort, self._CLUSTER_SORTS['latest'])
-        cat_filter = "AND a.category=%s" if category else ""
+        # Category is filtered on the CLUSTER's majority category, in an outer
+        # query — NOT on individual articles in the WHERE clause.
+        #
+        # Filtering articles was wrong three ways at once. A cluster with one
+        # economics article and four politics ones was returned for
+        # category=economics, then displayed a POLITICS badge (the badge has
+        # always shown the majority), and its article_count and sources were
+        # computed from the filtered rows, so a 5-outlet event reported 1.
+        # The feed showed politics stories under the Economics tab.
+        cat_filter = ""
         topic_filter = (
             "AND a.cluster_id IN (SELECT cluster_id FROM cluster_labels WHERE topic_id=%s)"
             if topic_id is not None else ""
         )
-        # Order matters: both filters sit in WHERE, ahead of HAVING's %s.
+        # Order matters: the filters sit in WHERE, ahead of HAVING's %s.
         params = []
-        if category:
-            params.append(category)
         if topic_id is not None:
             params.append(topic_id)
         params.append(min_size)
@@ -1285,8 +1293,21 @@ class ArticleDatabase:
         # "this cluster has an article newer than X" catches both brand new
         # events and new coverage of old ones.
         params.append(since_id)
+        # Applied to the GROUPED rows, so it matches the badge the UI shows
+        # and leaves the per-cluster aggregates counting every article.
+        params.append(category)
+        params.append(category)
+        # Paging in SQL, not in Python. The caller previously received every
+        # matching cluster and sliced it — 101 rows built with per-cluster
+        # subqueries to display 10.
+        page_clause = ''
+        if limit is not None:
+            page_clause = 'LIMIT %s OFFSET %s'
+            params.append(limit)
+            params.append(offset)
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(f'''
+                SELECT * FROM (
                 SELECT
                     a.cluster_id,
                     COUNT(DISTINCT (a.source, LOWER(TRIM(a.title)))) as article_count,
@@ -1317,7 +1338,10 @@ class ArticleDatabase:
                 HAVING COUNT(DISTINCT (a.source, LOWER(TRIM(a.title)))) >= %s
                    AND COUNT(DISTINCT a.source) >= %s
                    AND MAX(a.id) > %s
-                ORDER BY {order_by}
+            ) grouped
+            WHERE (%s IS NULL OR grouped.category = %s)
+            ORDER BY {order_by}
+            {page_clause}
             ''', params)
             rows = cur.fetchall()
 

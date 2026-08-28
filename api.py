@@ -633,14 +633,12 @@ def list_clusters(
     """
     clusters = db.get_clusters(min_size=min_size, min_sources=min_sources,
                                category=category, topic_id=topic_id, sort=sort,
-                               since_id=since_id)
+                               since_id=since_id, limit=limit, offset=offset)
     if response is not None:
         # The watermark for the next incremental call. Returned as a header so
         # the response body stays a plain list and existing clients are
         # unaffected.
         response.headers['X-Max-Article-Id'] = str(db.get_max_article_id())
-    total = len(clusters)
-    clusters = clusters[offset:offset + limit] if limit else clusters[offset:]
     if not include_articles:
         return clusters
 
