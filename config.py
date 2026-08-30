@@ -870,6 +870,36 @@ SEARCH_RRF_K = int(os.environ.get('SEARCH_RRF_K', 60))
 SEARCH_MIN_SCORE_HIGH = float(os.environ.get('SEARCH_MIN_SCORE_HIGH', 0.90))
 SEARCH_MIN_SCORE_LOW = float(os.environ.get('SEARCH_MIN_SCORE_LOW', 0.82))
 
+# ── corroboration between the two retrieval channels ──────────────────────
+# The bands above read confidence off the dense cosine ALONE, which quietly
+# wasted the lexical channel: it could reorder results but never rescue a
+# verdict. That is backwards for exactly the queries hybrid retrieval exists
+# to serve. Measured on the live corpus, the query "Bus Lalith" ranked
+# cluster 3435 FIRST in both channels, and was still reported not_found
+# because its cosine was 0.8104 — sixteen thousandths under the cutoff.
+#
+# The cause is structural, not a mis-set number. A two-word proper noun is
+# embedded as a very short text and compared against article vectors built
+# from a title plus 500 characters of body, so it cannot reach the scores a
+# full sentence does: "Sri Lanka gave money to Nepal after the floods"
+# measured 0.9379 against the same corpus. Short entity queries live in a
+# lower band than claim-shaped ones, permanently.
+#
+# So agreement between the channels is treated as evidence in its own right.
+# A cluster ranked inside the top SEARCH_CORROBORATION_RANK by BOTH the
+# vector and the keyword channel has been found twice, by methods with
+# opposite blind spots, and its verdict shifts one band down the ladder.
+#
+# Lowering SEARCH_MIN_SCORE_LOW instead would have been the wrong fix:
+# unrelated articles score ~0.75 under this provider, so a cutoff near 0.78
+# applied to EVERY query sits almost on the noise floor. Applied only to
+# doubly-confirmed matches, it is safe.
+SEARCH_CORROBORATION_RANK = int(os.environ.get('SEARCH_CORROBORATION_RANK', 5))
+
+# The floor for a corroborated match. Above the ~0.75 noise floor, below
+# SEARCH_MIN_SCORE_LOW; never applied to a cluster only one channel found.
+SEARCH_MIN_SCORE_FLOOR = float(os.environ.get('SEARCH_MIN_SCORE_FLOOR', 0.78))
+
 # How article-level evidence rolls up to a cluster score: 'max' (one strongly
 # matching article is enough to say the event is present) or 'mean3' (mean of
 # the top 3, rewarding corroboration across outlets). 'max' by default;

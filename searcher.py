@@ -48,6 +48,7 @@ from database import ArticleDatabase
 from config import (
     SEARCH_CANDIDATES, SEARCH_TOP_K, SEARCH_RRF_K,
     SEARCH_MIN_SCORE_HIGH, SEARCH_MIN_SCORE_LOW, SEARCH_AGGREGATION,
+    SEARCH_CORROBORATION_RANK, SEARCH_MIN_SCORE_FLOOR,
 )
 
 logger = logging.getLogger(__name__)
@@ -142,12 +143,29 @@ class ClaimSearcher:
         # most confident one — and best_score always describes matches[0]
         # rather than something further down the list.
         selected = sorted(clusters.items(), key=lambda kv: kv[1]['rrf'], reverse=True)[:top_k]
-        ranked = sorted(selected, key=lambda kv: kv[1]['confidence'], reverse=True)
-        best_score = ranked[0][1]['confidence'] if ranked else 0.0
 
+        # A cluster ranked near the top by BOTH channels has been found twice
+        # by methods with opposite blind spots. That outranks a cluster only
+        # the vector channel liked, even one with a slightly higher cosine —
+        # measured on "Bandaranaike", where the dense channel's favourite was
+        # an unrelated parliament story at 0.808 while the cluster both
+        # channels agreed on sat second.
+        for cid, entry in selected:
+            entry['corroborated'] = self._corroborated(cid, dense, lexical)
+
+        ranked = sorted(
+            selected,
+            key=lambda kv: (kv[1]['corroborated'], kv[1]['confidence']),
+            reverse=True,
+        )
+        best_score = ranked[0][1]['confidence'] if ranked else 0.0
+        corroborated = bool(ranked) and ranked[0][1]['corroborated']
+
+        high = SEARCH_MIN_SCORE_LOW if corroborated else SEARCH_MIN_SCORE_HIGH
+        low = SEARCH_MIN_SCORE_FLOOR if corroborated else SEARCH_MIN_SCORE_LOW
         status = (
-            'found' if best_score >= SEARCH_MIN_SCORE_HIGH
-            else 'partial' if best_score >= SEARCH_MIN_SCORE_LOW
+            'found' if best_score >= high
+            else 'partial' if best_score >= low
             else 'not_found'
         )
 
@@ -184,6 +202,25 @@ class ClaimSearcher:
         from embedder import ArticleEmbedder
         prepared = ArticleEmbedder._build_text({'title': text, 'body_cleaned': ''})
         return embedding_provider.encode([prepared], task='query')[0].tolist()
+
+    @staticmethod
+    def _corroborated(cluster_id: int, dense: List[Dict],
+                      lexical: List[Dict]) -> bool:
+        """
+        True when this cluster is ranked inside the top
+        SEARCH_CORROBORATION_RANK of BOTH channels.
+
+        Rank, not score: the two channels' scores are not on comparable
+        scales, which is the same reason fusion uses RRF. A cluster's rank in
+        a channel is the best rank of any of its articles there.
+        """
+        def best_rank(rows: List[Dict]) -> int:
+            for rank, row in enumerate(rows, start=1):
+                if row['cluster_id'] == cluster_id:
+                    return rank
+            return 10 ** 6
+        return (best_rank(dense) <= SEARCH_CORROBORATION_RANK
+                and best_rank(lexical) <= SEARCH_CORROBORATION_RANK)
 
     @staticmethod
     def _aggregate(sims: List[float]) -> float:
