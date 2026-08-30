@@ -9,12 +9,78 @@ import psycopg2
 import psycopg2.extras
 import psycopg2.pool
 from typing import List, Dict, Tuple, Optional
+from urllib.parse import urlsplit, urlunsplit
 from config import DATABASE_URL
 
 logger = logging.getLogger(__name__)
 
+# Query parameters that identify a campaign, not an article. Everything else
+# is kept: adaderana's legacy ?nid= form, for one, IS the article id.
+_TRACKING_PARAMS = ('utm_', 'fbclid', 'gclid', 'mc_cid', 'mc_eid', 'ref=', 'amp=')
+
+
+def canonical_url(url: str) -> str:
+    """
+    One spelling per article, so `url UNIQUE` can actually do its job.
+
+    Outlets serve the same story under several URLs, and each scraper method
+    handled that differently — some called .rstrip('/'), most did not. The
+    result was 485 duplicate rows, ~6% of the corpus. Normalising here rather
+    than at the ten-odd call sites means every scraper gets it for free.
+
+    Handles, measured against the real duplicates:
+
+      trailing slash   economynext, asianmirror, lankanewsweb
+      www. / scheme    adaderana serves both www and bare, http and https
+
+    It deliberately does NOT try to fix daily_ft's /columns/ vs /opinion/ or
+    daily_mirror's /breaking-news/ vs /recomended-news/. Those carry the same
+    article under genuinely different paths, and a rule guessing which path
+    segment is "the section" would be wrong somewhere. save_article()'s
+    title guard catches those instead.
+    """
+    if not url:
+        return url
+    try:
+        parts = urlsplit(url.strip())
+        if not parts.netloc:
+            return url.strip()
+        host = parts.netloc.lower()
+        if host.startswith('www.'):
+            host = host[4:]
+        query = '&'.join(
+            kv for kv in parts.query.split('&')
+            if kv and not any(kv.lower().startswith(t) for t in _TRACKING_PARAMS)
+        )
+        # Fragments never address a different article.
+        return urlunsplit(('https', host, parts.path.rstrip('/') or '/', query, ''))
+    except Exception:
+        return url.strip()
+
 _pool = psycopg2.pool.ThreadedConnectionPool(1, 20, DATABASE_URL)
 _pool_lock = __import__('threading').Lock()
+
+# When a pooled connection was last handed back, keyed by id(). Used to decide
+# whether _get_conn() needs to spend a round trip checking it is still alive —
+# see the comment there. Keyed by id() rather than by the connection object
+# because psycopg2 connections are not hashable-by-identity in a way that
+# survives the pool's internal bookkeeping; entries are removed when a
+# connection is discarded, and the pool caps at 20, so it cannot grow.
+_last_used: dict = {}
+
+# A connection idle longer than this is health-checked before reuse. Neon
+# suspends after minutes, so seconds of headroom is ample.
+_HEALTHCHECK_AFTER = 20.0
+
+# Every known article url, so url_exists() answers from memory instead of a
+# round trip per candidate link. Guarded by its own lock: the scraper calls
+# url_exists() from SCRAPE_MAX_WORKERS threads at once, and two of them
+# arriving on an expired cache must not both run the reload.
+_url_cache_lock = __import__('threading').Lock()
+
+# Long enough to cover a whole pipeline run, short enough that a long-lived
+# scheduler process still picks up rows written by anything else.
+_URL_CACHE_TTL = 900.0
 
 
 def _discard(pool, conn):
@@ -88,12 +154,32 @@ def _get_conn():
             last_err = psycopg2.OperationalError("connection was already closed")
             continue
 
+        # Verify the socket only if this connection has been sitting idle
+        # long enough to plausibly have been dropped.
+        #
+        # The check is a full round trip, and this database is ~178 ms away
+        # (Neon, ap-southeast-1). Running it on EVERY acquisition made it the
+        # single most expensive thing in the pipeline: measured at 133 ms of
+        # the ~764 ms each url_exists() cost, against a query whose own
+        # execution time is 0.067 ms. One scrape of economynext alone spent
+        # 391 seconds this way.
+        #
+        # Neon suspends after minutes of inactivity, not seconds, so a
+        # connection handed back and immediately reused is not a candidate
+        # for having gone stale. Checking only past _HEALTHCHECK_AFTER keeps
+        # the protection for the case it was written for — the first call
+        # after a quiet period — and skips it during the bursts of hundreds
+        # of calls where it costs the most and can protect the least.
+        if time.time() - _last_used.get(id(conn), 0.0) < _HEALTHCHECK_AFTER:
+            return conn
         try:
             with conn.cursor() as cur:
                 cur.execute('SELECT 1')  # verify the socket is actually alive
+            _last_used[id(conn)] = time.time()
             return conn
         except psycopg2.Error as e:
             last_err = e
+            _last_used.pop(id(conn), None)
             _discard(pool, conn)
             continue
 
@@ -106,9 +192,13 @@ def _put_conn(conn):
     putconn() rejects a connection it does not own, and silently dropping it
     would leak the socket, so it is closed instead.
     """
+    # Stamped on release rather than acquisition: what _get_conn() needs to
+    # know is how long the connection has been sitting in the pool unused.
+    _last_used[id(conn)] = time.time()
     try:
         _pool.putconn(conn)
     except Exception:
+        _last_used.pop(id(conn), None)
         try:
             conn.close()
         except Exception:
@@ -116,6 +206,12 @@ def _put_conn(conn):
 
 
 class ArticleDatabase:
+
+    # Shared across every instance on purpose. The scraper, extractor and API
+    # each construct their own ArticleDatabase, and the url set is the same
+    # answer for all of them — per-instance caches would each pay the load.
+    _url_cache: Optional[set] = None
+    _url_cache_at: float = 0.0
 
     def __init__(self):
         self.init_db()
@@ -170,6 +266,13 @@ class ArticleDatabase:
                         'cluster_excluded BOOLEAN DEFAULT FALSE')
             cur.execute('ALTER TABLE articles ADD COLUMN IF NOT EXISTS embedding_model TEXT')
             cur.execute('ALTER TABLE articles ADD COLUMN IF NOT EXISTS embedding_source_hash TEXT')
+            # Hash of the body's opening, so "this site handed us the wrong
+            # article again" is detectable ACROSS runs and not only within one
+            # extraction batch — see extractor._fingerprint and
+            # get_known_body_fingerprints().
+            cur.execute('ALTER TABLE articles ADD COLUMN IF NOT EXISTS body_fingerprint TEXT')
+            cur.execute('CREATE INDEX IF NOT EXISTS idx_body_fp '
+                        'ON articles (source, body_fingerprint)')
             cur.execute('''
                 CREATE TABLE IF NOT EXISTS custom_sources (
                     id           SERIAL PRIMARY KEY,
@@ -324,14 +427,37 @@ class ArticleDatabase:
         try:
             conn = self._connect()
             with conn.cursor() as cur:
+                title = article['title'][:500]
+                # The NOT EXISTS clause is the second duplicate defence, for
+                # the cases canonical_url() cannot see: daily_ft publishes the
+                # same column under /columns/ and /opinion/, daily_mirror under
+                # /breaking-news/ and /recomended-news/, and adaderana serves
+                # one story under a CUID url, a numeric-slug url and a legacy
+                # news.php?nid= url. Nothing about those strings says they are
+                # the same article — but the headline is identical every time.
+                #
+                # Scoped to 3 days because some headlines legitimately recur:
+                # economynext runs "Sri Lanka rupee closes at ..." daily. A
+                # repeat a week later is a new article; a repeat the same
+                # afternoon is the same one arriving by a second route.
+                #
+                # Kept in ONE statement rather than a SELECT then an INSERT:
+                # save_batch() calls this per article, and a second round trip
+                # per article is real money on Neon's transfer quota.
                 cur.execute('''
                     INSERT INTO articles (title, body, url, published_at, source, category, image_url, body_fetched)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    SELECT %s, %s, %s, %s, %s, %s, %s, %s
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM articles
+                        WHERE source = %s
+                          AND lower(trim(title)) = lower(trim(%s))
+                          AND COALESCE(published_at, scraped_at) > now() - interval '3 days'
+                    )
                     ON CONFLICT (url) DO NOTHING
                 ''', (
-                    article['title'][:500],
+                    title,
                     article.get('body', '')[:50000],
-                    article['url'],
+                    canonical_url(article['url']),
                     article.get('published_at'),
                     article['source'],
                     article.get('category', 'general'),
@@ -340,10 +466,16 @@ class ArticleDatabase:
                     # article pages render client-side) mark it fetched so the
                     # extractor step doesn't overwrite it with an empty result
                     int(article.get('body_fetched', 0)),
+                    article['source'],
+                    title,
                 ))
                 saved = cur.rowcount > 0
             conn.commit()
             self._release(conn)
+            if saved:
+                # Keep the in-memory url set current, so later links in this
+                # same run are checked against what this run already wrote.
+                self._remember_url(canonical_url(article['url']))
             return saved
         except Exception as e:
             logger.error(f"Error saving article: {e}")
@@ -352,15 +484,49 @@ class ArticleDatabase:
     def save_batch(self, articles: List[Dict]) -> int:
         return sum(1 for a in articles if self.save_article(a))
 
-    def update_body(self, article_id: int, body: str, image_url: str = None):
+    def update_body(self, article_id: int, body: str, image_url: str = None,
+                    fingerprint: str = None):
         conn = self._connect()
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE articles SET body=%s, body_fetched=1, image_url=COALESCE(%s, image_url) WHERE id=%s",
-                (body[:50000], image_url or None, article_id)
+                "UPDATE articles SET body=%s, body_fetched=1, "
+                "body_fingerprint=%s, image_url=COALESCE(%s, image_url) "
+                "WHERE id=%s",
+                (body[:50000], fingerprint or None, image_url or None, article_id)
             )
         conn.commit()
         self._release(conn)
+
+    def get_known_body_fingerprints(self, sources: List[str]) -> Dict[Tuple[str, str], str]:
+        """
+        {(source, body_fingerprint): title} for bodies this source has already
+        produced.
+
+        Used by the extractor to recognise a body it has seen before under a
+        DIFFERENT headline — the signature of a site serving the wrong article.
+        The in-batch duplicate check cannot see this: the same wrong block
+        extracted in two separate runs looked unique both times, and 65
+        articles ended up storing another article's text, 64 of them inside
+        live clusters. Identical bodies embed identically, so they also
+        fabricated clusters — three unrelated economynext stories were grouped
+        purely because all three had been handed the same wrong text.
+
+        One query per batch rather than one per article: the database is
+        ~178 ms away, and a per-article lookup is exactly the pattern that
+        made scraping take 40 minutes.
+        """
+        if not sources:
+            return {}
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT source, body_fingerprint, title FROM articles "
+                "WHERE source = ANY(%s) AND body_fingerprint IS NOT NULL",
+                (list(sources),)
+            )
+            out = {(r[0], r[1]): r[2] for r in cur}
+        self._release(conn)
+        return out
 
     def get_articles_to_clean(self) -> List[Dict]:
         conn = self._connect()
@@ -867,16 +1033,62 @@ class ArticleDatabase:
     # ── read ───────────────────────────────────────────────────────────────
 
     def url_exists(self, url: str) -> bool:
+        """
+        Has this url been seen before?
+
+        Answered from an in-memory set of every known url, refreshed at most
+        once per _URL_CACHE_TTL, rather than by one query per call.
+
+        Why: the ~20 scraping methods each call this once per candidate link,
+        so one run asks it a few thousand times. Every call was a round trip
+        to a database ~178 ms away, and with pool acquisition and the rollback
+        psycopg2 performs on release it measured at 764 ms — against a query
+        whose own execution time is 0.067 ms. Scraping economynext spent 391
+        seconds almost entirely in here, and the pipeline never reached stage 2
+        inside a ten-minute budget.
+
+        The whole url column is under a megabyte for this corpus and loads in
+        one round trip, so the set replaces thousands of them with one.
+
+        Staleness is bounded and harmless. A url written by another thread
+        mid-run may be missed, which at worst lets one duplicate reach
+        save_article() — where `url UNIQUE` and the (source, title) guard both
+        still apply. This cache is authoritative for "seen before", never for
+        "safe to insert"; that decision stays in the database.
+        """
         try:
-            conn = self._connect()
-            with conn.cursor() as cur:
-                cur.execute('SELECT id FROM articles WHERE url=%s', (url,))
-                row = cur.fetchone()
-            self._release(conn)
-            return row is not None
+            canon = canonical_url(url)
+            with _url_cache_lock:
+                now = time.time()
+                if (ArticleDatabase._url_cache is None
+                        or now - ArticleDatabase._url_cache_at > _URL_CACHE_TTL):
+                    conn = self._connect()
+                    with conn.cursor() as cur:
+                        cur.execute('SELECT url FROM articles')
+                        # Both spellings are kept: rows written before
+                        # canonical_url() existed still carry whatever the
+                        # scraper happened to send at the time.
+                        known = set()
+                        for (u,) in cur:
+                            known.add(u)
+                            known.add(canonical_url(u))
+                    self._release(conn)
+                    ArticleDatabase._url_cache = known
+                    ArticleDatabase._url_cache_at = now
+                    logger.info(f"URL cache loaded: {len(known)} known urls")
+                return url in ArticleDatabase._url_cache or canon in ArticleDatabase._url_cache
         except Exception as e:
             logger.error(f"Error checking URL: {e}")
             return False
+
+    @staticmethod
+    def _remember_url(url: str) -> None:
+        """Record a just-inserted url so the rest of this run sees it without
+        waiting for the cache to expire."""
+        if ArticleDatabase._url_cache is not None:
+            with _url_cache_lock:
+                ArticleDatabase._url_cache.add(url)
+                ArticleDatabase._url_cache.add(canonical_url(url))
 
     def get_articles_without_image(self, limit: int = 200) -> List[Dict]:
         conn = self._connect()
@@ -1493,7 +1705,8 @@ class ArticleDatabase:
         try:
             conn = self._connect()
             with conn.cursor() as cur:
-                cur.execute('SELECT id FROM articles WHERE url=%s', (url,))
+                cur.execute('SELECT id FROM articles WHERE url = %s OR url = %s',
+                            (canonical_url(url), url))
                 row = cur.fetchone()
             self._release(conn)
             return row[0] if row else None

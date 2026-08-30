@@ -806,7 +806,24 @@ TOPIC_LABEL_BATCH = 15
 # immediately, after which every later stage in the run fell back to its
 # fail-closed path. `gemini-2.5-flash` was also in this list and now returns
 # 404, wasting a round trip on every single call.
-GEMINI_LABEL_MODELS = ['gemini-3.1-flash-lite', 'gemini-flash-latest']
+#
+# `gemini-flash-latest` is now dropped for the same reason, 29 Aug 2026.
+# Measured across four calls it returned 503 "experiencing high demand" every
+# time, taking 5.8s, 28.5s, 38.5s and 55.8s to say so. Every caller below
+# walks this list and falls through to the next model on BOTH an HTTP error
+# and an unparseable reply — and a reply carrying 14 names where 15 were
+# asked for is an ordinary, frequent outcome. So each stumble on the fast
+# model was paying ~30s for a dead one, at six call sites, on every run. That
+# was the single largest cost in the pipeline: roughly 33 of ~40 minutes,
+# against ~7 minutes for all the actual scraping, extraction, embedding and
+# clustering combined.
+#
+# A one-model list is not a downgrade. At 20 requests/day the fallback could
+# only ever have served one run in twenty, and every LLM stage already fails
+# closed — a topic with no new name keeps the good one it has and retries on
+# the next run. Restore a second entry only after timing it against the live
+# API; a model that is merely *present* costs real minutes when it is down.
+GEMINI_LABEL_MODELS = ['gemini-3.1-flash-lite']
 
 # Below this _title_quality score (0-1), the heuristic's best real headline
 # is considered too weak to use as-is — too short, opinion-toned, no

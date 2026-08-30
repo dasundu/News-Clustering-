@@ -1,0 +1,127 @@
+
+  SL News Clustering — starting scheduler
+  Pipeline runs every 60 min  |  Ctrl+C to stop
+  API:  python main.py --api  ->  http://localhost:8000
+
+============================================================
+  SL NEWS CLUSTERING  |    Run #1  |  30 Aug 2026  19:10:43
+============================================================
+
+  [1/5] Scraping news sites ...
+INFO  scraper  Scraping economynext...
+INFO  scraper  Scraping lankabusinessonline...
+INFO  scraper  Scraping daily_ft...
+INFO  scraper  Scraping business_today...
+INFO  scraper  Scraping adaderana...
+INFO  scraper  Scraping newsfirst...
+INFO  scraper  Scraping daily_mirror...
+INFO  scraper  Scraping the_morning...
+INFO  database  URL cache loaded: 12037 known urls
+INFO  scraper    daily_ft: 0 found · 0 new
+INFO  scraper  Scraping daily_news...
+INFO  scraper    the_morning: 0 found · 0 new
+INFO  scraper  Scraping hirunews...
+WARNING  scraper    No article elements found on lankabusinessonline
+INFO  scraper    lankabusinessonline: 0 found · 0 new
+INFO  scraper  Scraping the_island...
+INFO  scraper    newsfirst: 1 found · 1 new
+INFO  scraper  Scraping sunday_observer...
+INFO  scraper    daily_mirror: 5 found · 0 new
+INFO  scraper  Scraping colombo_gazette...
+INFO  scraper    adaderana: 4 found · 4 new
+INFO  scraper  Scraping ceylon_today...
+INFO  scraper    hirunews: 0 found · 0 new
+INFO  scraper  Scraping sunday_times...
+INFO  scraper    sunday_times: 0 found · 0 new
+INFO  scraper  Scraping onlanka...
+INFO  scraper    colombo_gazette: 0 found · 0 new
+INFO  scraper  Scraping asianmirror...
+INFO  scraper    the_island: 0 found · 0 new
+INFO  scraper  Scraping lankanewsweb...
+INFO  scraper    daily_news: 0 found · 0 new
+INFO  scraper  Scraping lankabusinessnews...
+INFO  scraper    sunday_observer: 0 found · 0 new
+INFO  scraper  Scraping news_lk...
+INFO  scraper    asianmirror: 0 found · 0 new
+INFO  scraper  Scraping helakuru...
+INFO  scraper    helakuru: 1 found · 0 new
+INFO  scraper    lankabusinessnews: 2 found · 2 new
+INFO  scraper    news_lk: 0 found · 0 new
+INFO  scraper    lankanewsweb: 0 found · 0 new
+INFO  scraper    ceylon_today: 0 found · 0 new
+INFO  scraper    economynext: 0 found · 0 new
+INFO  scraper    business_today: 0 found · 0 new
+INFO  scraper    onlanka: 0 found · 0 new
+        daily_ft                     found=0     new=0  [no articles]
+        the_morning                  found=0     new=0  [no articles]
+        lankabusinessonline          found=0     new=0  [no articles]
+        newsfirst                    found=1     new=1
+        daily_mirror                 found=5     new=0
+        adaderana                    found=4     new=4
+        hirunews                     found=0     new=0  [no articles]
+        sunday_times                 found=0     new=0  [no articles]
+        colombo_gazette              found=0     new=0  [no articles]
+        the_island                   found=0     new=0  [no articles]
+        daily_news                   found=0     new=0  [no articles]
+        sunday_observer              found=0     new=0  [no articles]
+        asianmirror                  found=0     new=0  [no articles]
+        helakuru                     found=1     new=0
+        lankabusinessnews            found=2     new=2
+        news_lk                      found=0     new=0  [no articles]
+        lankanewsweb                 found=0     new=0  [no articles]
+        ceylon_today                 found=0     new=0  [no articles]
+        economynext                  found=0     new=0  [no articles]
+        business_today               found=0     new=0  [no articles]
+        onlanka                      found=0     new=0  [no articles]
+  ----------------------------------------------------------
+        Total                        found=13    new=7
+
+  [2/5] Extracting article bodies ...
+INFO  extractor  Fetching body for 7 articles (8 concurrent)...
+INFO  extractor  Body extraction done: 7/7 successful
+        7 bodies fetched
+
+  [3/5] Cleaning text ...
+INFO  cleaner  Cleaning 7 articles...
+INFO  cleaner  Cleaned 7 articles
+        7 articles cleaned
+
+  [4/5] Embedding  (gemini:gemini-embedding-001:768) ...
+INFO  embedder  Embedding provider: gemini:gemini-embedding-001:768
+INFO  embedder  Embedding 14 articles...
+INFO  embedder  Embedded 14/14 articles (dim=768); classifier relabeled 3/14
+        14 articles embedded
+
+  [5/5] Clustering by news event  (HDBSCAN) ...
+INFO  clusterer  Embedding cache: 0 hits, 2816 fetched
+INFO  clusterer  Clustering 2816 articles from the last 14d... (adaptive epsilon=0.260)
+INFO  clusterer  Applied 1 manual cluster exclusions
+INFO  clusterer  Embedding cache: 2816 hits, 99 fetched
+INFO  clusterer  Cluster labels generated/refreshed for 1482 clusters
+INFO  clusterer  Embedding cache: 2893 hits, 1712 fetched
+INFO  clusterer  Merge check: 19/40 topic pairs merged (380 -> 361 topics)
+INFO  clusterer  Join check: 332 of 350 answered from cache
+INFO  clusterer  Join check: 10/18 newly asked accepted (142 more from cache)
+INFO  clusterer  Clearing 5 topic assignments that cannot be re-derived (no current embedding)
+INFO  clusterer  Topics: 361 covering 1123 clusters (971 core + 152 joined; 357 continued, 4 new, 18 relabelled)
+INFO  clusterer  Promoted 863 single-outlet stories to their own clusters
+INFO  clusterer  Clustering done: 1482 active clusters (1475 continued, 7 new), 0 noise
+        1482 clusters  |  2816 clustered  |  0 noise
+        361 topics  |  357 continued  |  4 new
+
+============================================================
+  PIPELINE FINISHED
+  Finished at    : 30 Aug 2026  19:18:38
+  Took           : 7m 47s
+  ----------------------------------------------------------
+    1 Scrape      2m 26s   31.3%  ########
+    2 Extract      19.5s    4.2%  #
+    3 Clean        15.9s    3.4%  #
+    4 Embed        34.5s    7.4%  ##
+    5 Cluster     4m 10s   53.7%  #############
+  ----------------------------------------------------------
+  Total articles : 7932   Clustered : 4861   Clusters : 2717
+============================================================
+  Next run at  30 Aug 2026  20:18:38
+============================================================
+
