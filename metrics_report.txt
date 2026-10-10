@@ -1,0 +1,143 @@
+
+==========================================================================
+  1. CORPUS COMPOSITION
+==========================================================================
+  Articles ingested                                     8,586  
+  With extracted body text                              7,203  83.9% of ingested
+  Embedded                                              7,666  89.3%
+  Assigned to a cluster                                 5,447  63.4%
+  Distinct producing outlets                               20  
+  Collection period                            2025-04-01 to 2026-09-15  
+  Event clusters                                        3,065  
+  Topics                                                  407  
+  Clusters assigned to a topic                          1,241  40.5% of clusters
+
+==========================================================================
+  2. INGESTION AND EXTRACTION YIELD (per source)
+==========================================================================
+  source                  articles  with body    yield
+  ----------------------------------------------------
+  daily_mirror                 731        633    86.6%
+  lankanewsweb                 705        626    88.8%
+  hirunews                     694        693    99.9%
+  economynext                  683        286    41.9%  <-- low
+  asianmirror                  605        555    91.7%
+  lankabusinessonline          595        535    89.9%
+  daily_ft                     579        475    82.0%
+  onlanka                      555        532    95.9%
+  ceylon_today                 548        527    96.2%
+  business_today               547        484    88.5%
+  adaderana                    507        482    95.1%
+  helakuru                     364        363    99.7%
+  the_island                   289          0     0.0%  <-- low
+  the_morning                  258        106    41.1%  <-- low
+  newsfirst                    242        241    99.6%
+  sunday_times                 199        196    98.5%
+  lankabusinessnews            184        175    95.1%
+  daily_news                   147        141    95.9%
+  colombo_gazette               93         93   100.0%
+  sunday_observer               61         60    98.4%
+  ----------------------------------------------------
+  Sources at >=50% extraction yield                     17/20  85%
+
+==========================================================================
+  3. CLUSTER SIZE DISTRIBUTION
+==========================================================================
+  Clusters                                              3,053  
+  Mean articles per cluster                              1.78  
+  Median                                                    1  
+  Std deviation                                          1.47  
+  Max                                                      21  
+  Singleton clusters                                    1,936  63.4% of clusters
+  Multi-article clusters                                1,117  36.6%
+
+==========================================================================
+  4. CROSS-OUTLET COVERAGE
+==========================================================================
+  The population usable for cross-outlet comparison.
+
+    outlets   clusters    share  cumulative
+  ------------------------------------------
+          1      2,050    67.1%       67.1%
+          2        575    18.8%       86.0%
+          3        240     7.9%       93.8%
+          4        111     3.6%       97.5%
+          5         46     1.5%       99.0%
+          6         17     0.6%       99.5%
+          7          7     0.2%       99.8%
+          8          5     0.2%       99.9%
+          9          1     0.0%      100.0%
+         11          1     0.0%      100.0%
+  ------------------------------------------
+  Clusters with >=2 outlets                             1,003  32.9% of clusters
+  Clusters with >=3 outlets                               428  14.0% of clusters
+  Clusters with >=5 outlets                                77  2.5% of clusters
+  Mean outlets per cluster                               1.57  
+
+==========================================================================
+  5. TOPIC LAYER
+==========================================================================
+  Topics                                                  407  
+  Mean clusters per topic                                3.05  
+  Median                                                    2  
+  Max                                                      23  
+  Topic coverage (clusters in a topic)                  1,241  40.5%
+  Topic coverage of multi-outlet clusters           637/1,003  63.5%
+
+==========================================================================
+  6. INTERNAL VALIDATION  (no ground truth required)
+==========================================================================
+  Computed over 4,000 articles (sampled)
+
+  Mean intra-cluster coherence                         0.9758  cosine to own centroid
+  Median                                               0.9773  
+  Std deviation                                        0.0157  
+  Min / Max                                     0.925 / 1.000  
+  Clusters above 0.90 coherence                       804/804  100.0%
+
+  Same-cluster mean similarity                         0.9225  sd 0.0517
+  Different-cluster mean similarity                    0.7473  sd 0.0335
+  Separation (difference of means)                     0.1752  
+  Cohen's d (effect size)                               4.025  convention: >0.8 is large
+  Same-cluster 1th percentile                          0.7938  
+  Same-cluster 5th percentile                          0.8324  
+  Different-cluster 95th percentile                    0.8049  
+  Different-cluster 99th percentile                    0.8313  
+  Distribution overlap                                  0.93%  different-cluster pairs above same-cluster 5th pct
+
+  Silhouette coefficient                               0.3587  range -1 to 1, higher better
+  Davies-Bouldin index                                 1.2749  lower better
+  Calinski-Harabasz index                                 7.1  higher better
+    computed over                              2,302 articles  804 clusters
+
+==========================================================================
+  7. SOURCE CONCENTRATION
+==========================================================================
+  Herfindahl-Hirschman Index                           0.0745  concentration; 1/n = perfectly even
+  Even-distribution reference (1/n)                    0.0500  
+  Largest source share                                  12.5%  
+  Top-3 share                                           34.3%  
+
+==========================================================================
+  INTERPRETATION — STATE THIS IN THE THESIS
+==========================================================================
+
+  Every figure above is computed from live data and requires no labelled
+  ground truth. Sections 1-5 and 7 are descriptive statistics. Section 6
+  is INTERNAL validation: it measures whether clusters are geometrically
+  tight and mutually separated.
+
+  Internal validation does not establish semantic correctness. A clustering
+  can be geometrically excellent and still group the wrong articles. The
+  following remain REQUIRED and are not substitutable by anything above:
+
+    - Adjusted Rand Index          needs a labelled gold set
+    - Normalised Mutual Information  needs a labelled gold set
+    - Pairwise precision/recall/F1   needs a labelled gold set
+    - Homogeneity / completeness     needs a labelled gold set
+    - Baseline comparison            needs the same gold set
+    - Identity retention across runs needs instrumented consecutive runs
+
+  Report Section 6 as evidence that the clusters are WELL-FORMED, never as
+  evidence that they are CORRECT. Conflating the two is the single most
+  common error in clustering evaluation and an examiner will look for it.
