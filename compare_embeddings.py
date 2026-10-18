@@ -201,14 +201,14 @@ def main():
         suggested = float(np.percentile(new_rand, pct)) if 0 < pct < 100 else float('nan')
         print(f"  {name:<38} {value:>6.2f}  {pct:>5.1f}%  {suggested:>6.2f}")
 
-    # _adaptive_epsilon clamps a EUCLIDEAN distance over unit vectors, so it
-    # has to be mapped through the distance distribution, not the similarity
-    # one: d = sqrt(2 - 2*cos).
+    # CLUSTER_SELECTION_EPSILON is a EUCLIDEAN distance over unit vectors, so
+    # it has to be mapped through the distance distribution, not the
+    # similarity one: d = sqrt(2 - 2*cos). 0.45 was the local model's value.
     old_d_all = np.sqrt(np.maximum(0.0, 2 - 2 * np.concatenate([old_same, old_rand])))
     new_d_all = np.sqrt(np.maximum(0.0, 2 - 2 * np.concatenate([new_same, new_rand])))
     print()
-    print("  _adaptive_epsilon clamp (clusterer.py, euclidean over unit vectors)")
-    for label, value in (('low', 0.15), ('high', 0.45)):
+    print("  CLUSTER_SELECTION_EPSILON (config.py, euclidean over unit vectors)")
+    for label, value in (('epsilon', 0.45),):
         pct = float((old_d_all < value).mean() * 100)
         suggested = float(np.percentile(new_d_all, pct)) if pct > 0 else value * 0.5
         print(f"    {label:<5} {value:.2f}  ->  {suggested:.3f}   (pct {pct:.1f}% of distances)")

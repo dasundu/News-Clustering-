@@ -20,8 +20,8 @@ new one" — each run:
   1. Re-fits HDBSCAN structurally, but only on articles from the last
      CLUSTER_WINDOW_DAYS (bounds run time as the corpus grows, and keeps
      clustering focused on live coverage rather than resurrecting old news),
-     with an adaptive cluster_selection_epsilon sized to that run's own data
-     rather than one fixed value for every run (see _adaptive_epsilon).
+     with a fixed cluster_selection_epsilon (see CLUSTER_SELECTION_EPSILON in
+     config.py for why it is no longer adaptive).
   2. Runs a quality-refinement pass over those raw structural groups: splits
      anything oversized, too semantically loose, spanning too many days, or
      dominated by a single outlet; merges complementary single-outlet
@@ -81,7 +81,7 @@ from config import (
     CLUSTER_PROMOTE_SOLO, CLUSTER_OUTLIER_MARGIN, CLUSTER_OUTLIER_FLOOR,
     CLUSTER_EVICT_OUTLIERS, CLUSTER_EVICT_LLM_LOW, CLUSTER_EVICT_LLM_HIGH,
     CLUSTER_EVICT_LLM_BATCH,
-    EPSILON_CLAMP_LOW, EPSILON_CLAMP_HIGH,
+    CLUSTER_SELECTION_EPSILON,
 )
 
 logger = logging.getLogger(__name__)
@@ -591,46 +591,6 @@ def _match_to_previous(new_centroids: dict, prev_centroids: dict,
     return matched
 
 
-def _adaptive_epsilon(matrix: np.ndarray, low: float = None, high: float = None,
-                       percentile: float = 25.0, sample_size: int = 500) -> float:
-    """
-    HDBSCAN's cluster_selection_epsilon as a percentile of this run's own
-    pairwise embedding distances, clamped to a sane range, instead of one
-    fixed value for every run. A quiet news day (articles more spread out)
-    and a single dominant story breaking (many near-duplicate articles) call
-    for different merge radii; this adapts to which one a given run looks
-    like. Same idea as the sibling project's adaptive agglomerative-clustering
-    threshold, re-derived for euclidean distance over L2-normalized vectors
-    (the metric this project's HDBSCAN actually uses) rather than cosine
-    distance.
-    """
-    # Clamp bounds are provider-specific: they are euclidean distances over
-    # unit vectors, and the whole distance scale compresses under Gemini
-    # (same-event pairs sit near 0.40 apart vs 0.68 under the local model).
-    low = EPSILON_CLAMP_LOW if low is None else low
-    high = EPSILON_CLAMP_HIGH if high is None else high
-
-    n = len(matrix)
-    if n < 4:
-        return (low + high) / 2  # too few points to estimate a percentile
-
-    if n > sample_size:
-        rng = np.random.default_rng(seed=42)
-        sample = matrix[rng.choice(n, size=sample_size, replace=False)]
-    else:
-        sample = matrix
-
-    diffs = sample[:, None, :] - sample[None, :, :]
-    dists = np.sqrt((diffs ** 2).sum(axis=2))
-    upper = np.triu_indices(len(sample), k=1)
-    pairwise = dists[upper]
-    if pairwise.size == 0:
-        return (low + high) / 2
-
-    eps = float(np.percentile(pairwise, percentile))
-    return float(np.clip(eps, low, high))
-
-
 def _cluster_centroid(matrix: np.ndarray, indices: list) -> np.ndarray:
     return matrix[indices].mean(axis=0)
 
@@ -1060,15 +1020,14 @@ class ArticleClusterer:
         dates = [r['effective_date'] for r in rows]
         matrix = np.stack([vectors[i] for i in ids])
 
-        epsilon = _adaptive_epsilon(matrix)
         logger.info(f"Clustering {len(ids)} articles from the last "
-                    f"{CLUSTER_WINDOW_DAYS}d... (adaptive epsilon={epsilon:.3f})")
+                    f"{CLUSTER_WINDOW_DAYS}d... (epsilon={CLUSTER_SELECTION_EPSILON:.3f})")
         model = hdbscan.HDBSCAN(
             min_cluster_size=HDBSCAN_MIN_CLUSTER,
             min_samples=HDBSCAN_MIN_SAMPLES,
             metric='euclidean',
             cluster_selection_method='eom',
-            cluster_selection_epsilon=epsilon,
+            cluster_selection_epsilon=CLUSTER_SELECTION_EPSILON,
         )
         labels = model.fit_predict(matrix)
         labels = _refine_clusters(labels, matrix, sources, dates,

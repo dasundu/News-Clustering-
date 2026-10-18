@@ -482,13 +482,18 @@ CLUSTER_WINDOW_DAYS = 14
 # member-pair similarities driving that merge.
 CLUSTER_MATCH_THRESHOLD = float(os.environ.get('CLUSTER_MATCH_THRESHOLD', 0.90))
 
-# HDBSCAN's cluster_selection_epsilon is picked per run from the data, then
-# clamped to this range. Euclidean distance over unit vectors, so it is
-# provider-specific like every similarity constant: the local model put
-# same-event pairs ~0.68 apart and used [0.15, 0.45]; Gemini compresses that
-# to ~0.40, so the clamp scales down proportionally.
-EPSILON_CLAMP_LOW = float(os.environ.get('EPSILON_CLAMP_LOW', 0.09))
-EPSILON_CLAMP_HIGH = float(os.environ.get('EPSILON_CLAMP_HIGH', 0.26))
+# HDBSCAN's cluster_selection_epsilon. Euclidean distance over unit vectors,
+# so it is provider-specific like every similarity constant (the local model
+# used 0.45; Gemini compresses distances, so 0.26).
+#
+# Fixed, not adaptive. It used to be computed each run as the 25th percentile
+# of the window's pairwise distances, clamped to [0.09, 0.26]. In all 150 runs
+# logged from 20 Aug to 18 Oct 2026 the percentile came out far above 0.26,
+# so the clamp returned 0.26 every time: the value never adapted. Computing
+# it also allocated two 500 x 500 x 768 float32 arrays (~1.5 GB) per run,
+# which on a small host is enough to kill the pipeline. A fixed value gives
+# identical clustering without that cost.
+CLUSTER_SELECTION_EPSILON = float(os.environ.get('CLUSTER_SELECTION_EPSILON', 0.26))
 # MEASURED: under Gemini this knob is effectively inert. Actual pairwise
 # distances in a live window start around 0.55 (p1) with a median of 0.71,
 # far above any value in this range, so cluster_selection_epsilon never binds
