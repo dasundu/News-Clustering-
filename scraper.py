@@ -112,8 +112,16 @@ class NewsScraper:
                 logger.error(f"Error scraping {source_name}: {e}")
                 return source_name, 0, 0
 
+        # A source marked 'blocked' in config is known not to serve scripted
+        # clients. It is reported as blocked rather than retried, so the run
+        # summary says why it has nothing instead of a bare "0 found".
+        active = {n: c for n, c in NEWS_SOURCES.items() if not c.get('blocked')}
+        for name, cfg in NEWS_SOURCES.items():
+            if cfg.get('blocked'):
+                results['by_source'][name] = {'found': 0, 'new': 0, 'blocked': cfg['blocked']}
+
         with ThreadPoolExecutor(max_workers=SCRAPE_MAX_WORKERS) as pool:
-            futures = [pool.submit(_scrape_one, name, cfg) for name, cfg in NEWS_SOURCES.items()]
+            futures = [pool.submit(_scrape_one, name, cfg) for name, cfg in active.items()]
             for future in as_completed(futures):
                 source_name, found, new_count = future.result()
                 results['total_found'] += found

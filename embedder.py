@@ -82,15 +82,15 @@ class ArticleEmbedder:
                 break
             dim = vectors.shape[1]
 
+            embedded, recategorised = [], []
             for article, text, vec in zip(chunk, texts, vectors):
                 vec32 = vec.astype('float32')
-                blob = vec32.tobytes()
                 source_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()
-                # embedding_list mirrors the same vector into the pgvector
-                # column /search reads — written in the same statement so the
-                # two representations can never drift apart (see database.py).
-                self.db.update_embedding(article['id'], blob, self.model_id,
-                                          source_hash, embedding_list=vec32.tolist())
+                # The vector goes to both the BYTEA column and its pgvector
+                # mirror that /search reads — the same statement per row, so
+                # the two representations can never drift apart.
+                embedded.append((vec32.tobytes(), self.model_id, source_hash,
+                                 vec32.tolist(), article['id']))
 
                 # Semantic second pass over the keyword-based category (see
                 # classifier.py) — refines economics/politics/general, never
@@ -98,9 +98,15 @@ class ArticleEmbedder:
                 old_cat = article.get('category') or 'general'
                 new_cat = refine_category(vec, old_cat)
                 if new_cat != old_cat:
-                    self.db.update_article_category(article['id'], new_cat)
-                    relabeled += 1
-                done += 1
+                    recategorised.append((new_cat, article['id']))
+
+            # One batch per chunk rather than a round trip per article. The
+            # chunk is still the commit unit, so a rate limit that stops the
+            # run keeps every chunk already written.
+            self.db.update_embeddings(embedded)
+            self.db.update_article_categories(recategorised)
+            done += len(embedded)
+            relabeled += len(recategorised)
 
         logger.info(
             f"Embedded {done}/{len(articles)} articles"

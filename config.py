@@ -97,6 +97,13 @@ NEWS_SOURCES = {
         'filter_keywords': False,
         'priority': 'HIGH',
         'description': 'EconomyNext — economic news',
+        # No new article since 30 Aug 2026. Checked 18 Oct 2026: every page,
+        # the feed and the WordPress API return Cloudflare 520, while
+        # robots.txt (served from Cloudflare's cache) loads, so the origin is
+        # not serving pages to this scraper. Skipped instead of retried every
+        # run; its 683 stored articles stay in their clusters. Remove this key
+        # to re-enable once the site answers again.
+        'blocked': 'Cloudflare 520 on every page since 30 Aug 2026',
     },
     'lankabusinessonline': {
         'max_articles': 12,
@@ -286,6 +293,13 @@ NEWS_SOURCES = {
         'filter_keywords': False,
         'priority': 'MEDIUM',
         'description': 'News.lk — government and policy news',
+        # Never stored a single article. Checked 18 Oct 2026: the site sits
+        # behind a Sucuri firewall that answers scripted clients with a
+        # JavaScript redirect challenge (HTTP 307), and /feed and /rss.xml are
+        # 404. Getting past it needs a headless browser, which this component
+        # deliberately avoids (see the thesis, section 7.5). Kept configured so
+        # the outlet list stays complete, but skipped rather than retried.
+        'blocked': 'Sucuri firewall challenge',
     },
 
     # ── Sinhala aggregator with English translations ───────────────────────
@@ -336,6 +350,14 @@ def outlet_name_fragments() -> set:
 # a few Gemini requests on topic maintenance against a 500/day free-tier
 # limit. Halving the cadence halves that fixed cost.
 SCRAPE_INTERVAL = int(os.environ.get('SCRAPE_INTERVAL', 120))
+
+# A source that stores no new article for this many days is flagged in the
+# end-of-run report. EconomyNext started answering every page with Cloudflare
+# 520 on 30 Aug 2026 and contributed nothing for seven weeks before anyone
+# noticed: each run printed "0 found" for that run alone, with nothing to say
+# the silence was weeks long. Three days is well past any outlet's quietest
+# normal gap, so the warning means a source is broken, not slow.
+STALE_SOURCE_DAYS = int(os.environ.get('STALE_SOURCE_DAYS', 3))
 MAX_ARTICLES_PER_SOURCE = 25
 REQUEST_TIMEOUT = 15        # seconds — 10s was clipping slower sites
                              # (ft.lk observed at 2-3s+ round trip, some

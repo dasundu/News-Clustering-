@@ -34,18 +34,22 @@ class TextCleaner:
             return 0
 
         logger.info(f"Cleaning {len(articles)} articles...")
-        count = 0
+        bodies, titles = [], []
         for article in articles:
             # Fix encoding on both title and body
             fixed_title = fix_encoding(article.get('title', ''))
-            cleaned_body = self._clean(fix_encoding(article['body']))
-            self.db.update_cleaned_body(article['id'], cleaned_body)
+            bodies.append((self._clean(fix_encoding(article['body'])), article['id']))
             if fixed_title != article.get('title', ''):
-                self.db.update_article_title(article['id'], fixed_title)
-            count += 1
+                titles.append((fixed_title, article['id']))
 
-        logger.info(f"Cleaned {count} articles")
-        return count
+        # Written as batches, not a round trip per article (see the batched
+        # writers in database.py). Cleaning is deterministic, so a failed
+        # batch is simply redone by the next run.
+        self.db.update_cleaned_bodies(bodies)
+        self.db.update_article_titles(titles)
+
+        logger.info(f"Cleaned {len(bodies)} articles")
+        return len(bodies)
 
     def _clean(self, text: str) -> str:
         if not text:

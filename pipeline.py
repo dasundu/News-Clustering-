@@ -30,6 +30,33 @@ def _line(char='-'):
     print('  ' + char * (W - 2))
 
 
+def _report_stale_sources():
+    """
+    Flags configured sources that have stored nothing new for
+    STALE_SOURCE_DAYS. A single run's "0 found" cannot tell a quiet hour from
+    an outlet that has been unreachable for weeks; this can. Advisory only:
+    a failure here must never stop the pipeline.
+    """
+    from config import NEWS_SOURCES, STALE_SOURCE_DAYS
+    from database import ArticleDatabase
+    try:
+        last_seen = ArticleDatabase().get_source_last_seen()
+    except Exception as e:
+        logger.warning(f"Stale-source check skipped: {e}")
+        return
+    stale = []
+    for name, cfg in NEWS_SOURCES.items():
+        if cfg.get('blocked'):
+            continue
+        days = last_seen.get(name)
+        if days is None:
+            stale.append((name, 'has never stored an article'))
+        elif days >= STALE_SOURCE_DAYS:
+            stale.append((name, f'no new article for {days:.0f} days'))
+    for name, why in sorted(stale):
+        logger.warning(f"Stale source: {name} {why}. Check whether it is down or blocking us.")
+
+
 def _header(run_num=None):
     print('=' * W)
     ts = datetime.now().strftime('%d %b %Y  %H:%M:%S')
@@ -63,11 +90,15 @@ def run_pipeline(run_num=None):
 
     for source, s in results['by_source'].items():
         status = f"found={s['found']:<4}  new={s['new']}"
-        flag = '  [no articles]' if s['found'] == 0 else ''
+        if s.get('blocked'):
+            flag = f"  [blocked: {s['blocked']}]"
+        else:
+            flag = '  [no articles]' if s['found'] == 0 else ''
         print(f"        {source:<28} {status}{flag}")
     _line()
     total_status = f"found={results['total_found']:<4}  new={results['total_new']}"
     print(f"        {'Total':<28} {total_status}")
+    _report_stale_sources()
     stage_times.append(('1 Scrape', time.time() - mark)); mark = time.time()
 
     # ── Step 2: Extract body ────────────────────────────────

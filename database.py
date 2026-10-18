@@ -552,6 +552,73 @@ class ArticleDatabase:
         conn.commit()
         self._release(conn)
 
+    def get_source_last_seen(self) -> Dict[str, float]:
+        """
+        Days since each source last stored a new article, by source name.
+        A source that never stored one is absent from the result. Feeds the
+        stale-source warning in the run summary (see STALE_SOURCE_DAYS).
+        """
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT source, EXTRACT(EPOCH FROM now() - max(scraped_at)) / 86400.0 "
+                    "FROM articles GROUP BY source"
+                )
+                return {source: float(days) for source, days in cur.fetchall()}
+        finally:
+            self._release(conn)
+
+    # ── Batched writers ────────────────────────────────────────────────────
+    # The cleaner and embedder used to write one row per call: a round trip
+    # to Neon (~0.2 s), a commit and a pool release per article. Measured on
+    # an 18 Oct catch-up run, that was most of Clean's 55 s for 278 articles
+    # and a large share of Embed's 3 m 40 s — the same per-row cost that
+    # once made url_exists() take 40 minutes. These send a whole batch in a
+    # few round trips and one commit. The single-row methods remain for the
+    # one-off scripts that call them.
+    _BATCH_PAGE = 200
+
+    def _write_batch(self, sql: str, rows: List[Tuple]):
+        if not rows:
+            return
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_batch(cur, sql, rows, page_size=self._BATCH_PAGE)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._release(conn)
+
+    def update_cleaned_bodies(self, rows: List[Tuple[str, int]]):
+        """rows: (body_cleaned, article_id)"""
+        self._write_batch("UPDATE articles SET body_cleaned=%s WHERE id=%s", rows)
+
+    def update_article_titles(self, rows: List[Tuple[str, int]]):
+        """rows: (title, article_id)"""
+        self._write_batch("UPDATE articles SET title=%s WHERE id=%s",
+                          [(t[:500], i) for t, i in rows])
+
+    def update_article_categories(self, rows: List[Tuple[str, int]]):
+        """rows: (category, article_id)"""
+        self._write_batch("UPDATE articles SET category=%s WHERE id=%s", rows)
+
+    def update_embeddings(self, rows: List[Tuple[bytes, str, str, List[float], int]]):
+        """
+        rows: (embedding_bytes, embedding_model, source_hash, embedding_list, article_id).
+        Writes the BYTEA vector and its pgvector mirror in one statement per
+        row, inside one transaction, so the two can never disagree — the same
+        guarantee update_embedding() gives for a single article.
+        """
+        self._write_batch(
+            "UPDATE articles SET embedding=%s, embedding_model=%s, "
+            "embedding_source_hash=%s, embedding_vec=%s WHERE id=%s",
+            [(psycopg2.Binary(b), m, h, str(v), i) for b, m, h, v, i in rows],
+        )
+
     def update_cleaned_body(self, article_id: int, cleaned: str):
         conn = self._connect()
         with conn.cursor() as cur:
