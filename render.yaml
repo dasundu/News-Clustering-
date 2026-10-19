@@ -1,0 +1,33 @@
+# Render Blueprint for the clustering API.
+# Deploy via https://dashboard.render.com/blueprints -> "New Blueprint Instance",
+# pointing at this repo. Render reads render.yaml from the repository root.
+#
+# This deploys ONLY the read-only API (api.py) with PIPELINE_ENABLED=false, so
+# every write route returns 503. The scrape/embed/cluster pipeline runs on
+# GitHub Actions (.github/workflows/pipeline.yml) against the same database.
+#
+# requirements-api.txt carries no torch/hdbscan/scikit-learn (~100 MB
+# installed); /search still works because queries are embedded over HTTP by
+# the Gemini provider.
+services:
+  - type: web
+    name: news-clustering-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements-api.txt
+    startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /stats
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.13.1"
+      - key: PIPELINE_ENABLED
+        value: "false"
+      - key: EMBEDDING_PROVIDER
+        value: gemini
+      - key: EMBEDDING_DIMENSION
+        value: "768"
+      # Secrets: set in the Render dashboard, never commit them.
+      - key: DATABASE_URL
+        sync: false
+      - key: GEMINI_API_KEY   # needed by /search to embed the query
+        sync: false

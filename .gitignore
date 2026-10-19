@@ -1,0 +1,18 @@
+venv/
+env/
+*.pyc
+__pycache__/
+*.db
+data/
+.DS_Store
+.vscode/
+.idea/
+*.log
+# Every .env variant, not just the bare name — a `.env.backup-...` or
+# `.env.local` holds the same secrets and was previously left untracked and
+# therefore committable. .env.example is the one intentional exception.
+.env*
+!.env.example
+*.egg-info/
+dist/
+build/
