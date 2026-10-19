@@ -12,7 +12,7 @@ repository is `DileepWick/perspective-lk`; this repository is the deployment cop
 
 | Piece | What it does | Where it runs |
 |---|---|---|
-| Pipeline (`pipeline.py`) | scrape → extract → clean → embed → cluster | GitHub Actions, every hour ([pipeline.yml](.github/workflows/pipeline.yml)) |
+| Pipeline (`pipeline.py`) | scrape → extract → clean → embed → cluster | a home connection (`main.py`, every 2 hours); GitHub Actions by hand only ([pipeline.yml](.github/workflows/pipeline.yml)) |
 | API (`api.py`) | serves events, topics, articles and claim search | Render free tier ([render.yaml](render.yaml)) |
 | Database | articles, embeddings, clusters, topics | Neon (PostgreSQL + pgvector) |
 
@@ -40,8 +40,8 @@ venv/Scripts/python.exe main.py --api        # API on http://localhost:8000 (doc
 3. **Website:** set `CLUSTERING_API_URL` to the Render address in the website's hosting settings.
 
 The free Render service sleeps after about 15 minutes idle and takes 30–60 seconds to wake.
-Only one pipeline should write to the database at a time: stop any local scheduler once the
-GitHub Actions schedule is running.
+Only one pipeline should write to the database at a time: stop the local scheduler before
+running the GitHub Actions workflow by hand.
 
 ## Evaluation tools
 

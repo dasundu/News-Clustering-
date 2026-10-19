@@ -2,8 +2,11 @@
 # scrape -> extract -> clean -> embed -> cluster, against the Neon database.
 # The read-only API (render.yaml) serves the results.
 #
-# Hourly. This repository is public, so GitHub Actions minutes are free and
-# unlimited. A run takes 3-5 minutes.
+# Schedule paused: several Sri Lankan outlets refuse GitHub's datacenter IPs
+# (403), so the pipeline runs from a home connection for now. To resume, put
+# back under "on:":
+#   schedule:
+#     - cron: "17 * * * *"   # every hour, at :17 to avoid the top-of-hour queue
 #
 # Needs two repository secrets (Settings -> Secrets and variables -> Actions):
 #   DATABASE_URL     the Neon connection string from your local .env
@@ -13,8 +16,6 @@
 name: Clustering pipeline
 
 on:
-  schedule:
-    - cron: "17 * * * *"   # every hour, at :17 to avoid the top-of-hour queue
   workflow_dispatch:
 
 # Two runs must never overlap: both would claim the same articles and race on
